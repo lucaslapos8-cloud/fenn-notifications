@@ -8,6 +8,7 @@
 #   theme|dark|#RRGGBB
 #   config|<solid|glass|tinted>|<size 0..4>|<tint 0..3>
 #   show|id|b64 app|b64 title|b64 body|b64 image|more|seconds|b64 when|b64 reply hint|b64 labels (0x1F separated)|b64 app icon badge
+#   marker|<none|dot|count>|<unread>
 #   hide
 # and it answers on stdout: ready, click|id, dismiss|id, hidden|id,
 # reply|id|b64 text, action|id|index
@@ -52,6 +53,8 @@ public class Bubble : Window {
     readonly System.Windows.Shapes.Path closeGlyph;
     readonly DispatcherTimer tick;
 
+    public Marker marker;
+    public bool IsOut { get { return IsVisible && (expanded || collapsing); } }
     string current = "", style = "tinted";
     int tint = 0; // Tinted strength: 0 full (almost black) .. 3 light (more see-through)
     static readonly byte[] TintAlpha = { 0xC4, 0xA6, 0x86, 0x66 };
@@ -687,6 +690,12 @@ public class Bubble : Window {
                     Pop(f[1], D(f[2]), D(f[3]), D(f[4]), D(f[5]), more, secs, D(f[8]), hint, labels, f.Length > 11 ? D(f[11]) : "");
                 }
                 break;
+            case "marker":
+                if (marker != null && f.Length >= 3) {
+                    int count; int.TryParse(f[2], out count);
+                    marker.Set(f[1], count, accent, dark);
+                }
+                break;
             case "hide":
                 Collapse();
                 break;
@@ -699,6 +708,7 @@ public class Bubble : Window {
     public static void Run() {
         var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
         var bubble = new Bubble();
+        bubble.marker = new Marker(bubble);
         var reader = new Thread(() => {
             string line;
             try {
@@ -713,6 +723,153 @@ public class Bubble : Window {
         reader.Start();
         app.Startup += (s, e) => Say("ready");
         app.Run();
+    }
+}
+
+// The unread marker: a small dot or count drawn in the gap between the time
+// and the date of Fenn's collapsed clock pill. Click-through, never focused.
+public class Marker : Window {
+    // Where Fenn draws its clock, relative to the screen centre, in DIPs.
+    const double GapCenter = 8.8, PillMid = 16.4, TimeEnd = -8, DateStart = 25.6;
+    readonly Bubble bubble;
+    readonly Grid holder;
+    readonly Ellipse dot;
+    readonly Border count;
+    readonly TextBlock countText;
+    readonly ScaleTransform pop = new ScaleTransform(1, 1);
+    readonly DispatcherTimer tick;
+    string style = "none";
+    bool dark = true, clockShowing = true, shown;
+    int n, checkIn;
+    IntPtr hwnd;
+
+    [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
+    [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int i, int v);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint f);
+
+    public Marker(Bubble owner) {
+        bubble = owner;
+        WindowStyle = WindowStyle.None; AllowsTransparency = true; Background = Brushes.Transparent;
+        Topmost = true; ShowInTaskbar = false; ShowActivated = false; ResizeMode = ResizeMode.NoResize;
+        Width = 30; Height = 33; Top = 0;
+        Left = SystemParameters.PrimaryScreenWidth / 2 + GapCenter - Width / 2;
+        Opacity = 0;
+        holder = new Grid { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Top,
+                            Margin = new Thickness(0, PillMid - 8, 0, 0), Height = 16,
+                            RenderTransformOrigin = new Point(0.5, 0.5), RenderTransform = pop };
+        dot = new Ellipse { Width = 7, Height = 7, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        countText = new TextBlock { FontSize = 9.5, FontWeight = FontWeights.Bold, Foreground = Brushes.White,
+                                    HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
+                                    Margin = new Thickness(0, 0, 0, 0.5) };
+        count = new Border { MinWidth = 15, Height = 15, CornerRadius = new CornerRadius(7.5), Padding = new Thickness(3, 0, 3, 0),
+                             HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Child = countText };
+        holder.Children.Add(dot);
+        holder.Children.Add(count);
+        Content = holder;
+        TextOptions.SetTextFormattingMode(this, TextFormattingMode.Display);
+        SourceInitialized += (s, e) => {
+            hwnd = new WindowInteropHelper(this).Handle;
+            // no activation, no taskbar entry, and clicks fall through to Fenn
+            SetWindowLong(hwnd, -20, GetWindowLong(hwnd, -20) | 0x08000000 | 0x80 | 0x20);
+        };
+        tick = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150) };
+        int ticks = 0;
+        tick.Tick += (s, e) => {
+            Update();
+            ticks++;
+            // Fenn re-raises its own full-width window now and then; stay above it.
+            if (shown && hwnd != IntPtr.Zero && ticks % 4 == 0) SetWindowPos(hwnd, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+            if (Environment.GetEnvironmentVariable("FENN_MARKER_DEBUG") == "1" && ticks % 7 == 0)
+                Bubble.Say("debug|marker shown=" + shown + " style=" + style + " n=" + n + " clock=" + clockShowing + " out=" + bubble.IsOut + " scale=" + Scale());
+        };
+        tick.Start();
+    }
+
+    public void Set(string newStyle, int number, Color accent, bool isDark) {
+        bool grew = number > n;
+        style = newStyle == "dot" || newStyle == "count" ? newStyle : "none";
+        n = number; dark = isDark;
+        var fill = new SolidColorBrush(accent);
+        dot.Fill = fill;
+        dot.Effect = new DropShadowEffect { BlurRadius = 6, ShadowDepth = 0, Opacity = 0.9, Color = accent };
+        count.Background = fill;
+        countText.Text = n > 99 ? "99+" : n.ToString();
+        dot.Visibility = style == "dot" ? Visibility.Visible : Visibility.Collapsed;
+        count.Visibility = style == "count" ? Visibility.Visible : Visibility.Collapsed;
+        checkIn = 0;
+        if (shown && grew) Pop(1.3); // a new message while it's showing: small bump
+        Update();
+    }
+
+    bool Wanted() {
+        if (style == "none" || n <= 0 || bubble.IsOut) return false;
+        POINT p; GetCursorPos(out p);
+        double scale = Scale();
+        double cx = SystemParameters.PrimaryScreenWidth / 2 * scale;
+        if (Math.Abs(p.X - cx) < 190 * scale && p.Y < 70 * scale) return false; // Fenn grows under the cursor
+        if (--checkIn <= 0) { checkIn = 5; clockShowing = ClockShowing(scale); }
+        return clockShowing;
+    }
+
+    [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
+
+    // Screen pixels per DIP in the coordinate space GetCursorPos and screen
+    // captures use for this process (works whatever DPI mode it runs in).
+    double Scale() {
+        double px = GetSystemMetrics(0); // SM_CXSCREEN
+        return px > 0 ? px / SystemParameters.PrimaryScreenWidth : 1.0;
+    }
+
+    // True when the pill shows Fenn's clock: text left and right of the gap,
+    // nothing at the gap's edges. Music in the pill or an open notch fails this.
+    bool ClockShowing(double scale) {
+        try {
+            int cx = (int)Math.Round(SystemParameters.PrimaryScreenWidth / 2 * scale);
+            int x0 = cx - (int)(90 * scale), w = (int)(180 * scale), y0 = (int)(6 * scale), h = (int)(22 * scale);
+            using (var bmp = new System.Drawing.Bitmap(w, h)) {
+                using (var g = System.Drawing.Graphics.FromImage(bmp)) g.CopyFromScreen(x0, y0, 0, 0, new System.Drawing.Size(w, h));
+                Func<double, double, bool> anyText = (from, to) => {
+                    int a = Math.Max(0, cx - x0 + (int)(from * scale)), b = Math.Min(w - 1, cx - x0 + (int)(to * scale));
+                    for (int x = a; x <= b; x++)
+                        for (int y = 0; y < h; y++) {
+                            var c = bmp.GetPixel(x, y);
+                            if (dark ? (c.R > 150 && c.G > 150 && c.B > 150) : (c.R < 90 && c.G < 90 && c.B < 90)) return true;
+                        }
+                    return false;
+                };
+                bool l = anyText(-60, TimeEnd - 1), r = anyText(DateStart + 1, 60);
+                // Leave a few pixels of slack next to the text: wider times like "11:23 PM" reach close to the gap.
+                bool gl = anyText(TimeEnd + 5, GapCenter - 9), gr = anyText(GapCenter + 9, DateStart - 4);
+                if (Environment.GetEnvironmentVariable("FENN_MARKER_DEBUG") == "1")
+                    Bubble.Say("debug|clock l=" + l + " r=" + r + " gl=" + gl + " gr=" + gr + " cx=" + cx + " x0=" + x0 + " w=" + w);
+                return l && r && !gl && !gr;
+            }
+        } catch { return true; }
+    }
+
+    void Update() {
+        bool want = Wanted();
+        if (want == shown) return;
+        shown = want;
+        if (want) {
+            Left = SystemParameters.PrimaryScreenWidth / 2 + GapCenter - Width / 2;
+            if (!IsVisible) Show();
+            if (hwnd != IntPtr.Zero) SetWindowPos(hwnd, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+            BeginAnimation(OpacityProperty, new DoubleAnimation(1, TimeSpan.FromMilliseconds(220)));
+            Pop(0.4);
+        } else {
+            var f = new DoubleAnimation(0, TimeSpan.FromMilliseconds(160));
+            f.Completed += (s, e) => { if (!shown) Hide(); };
+            BeginAnimation(OpacityProperty, f);
+        }
+    }
+
+    void Pop(double from) {
+        var a = new DoubleAnimation(from, 1, TimeSpan.FromMilliseconds(380)) { EasingFunction = new BackEase { Amplitude = 0.5, EasingMode = EasingMode.EaseOut } };
+        pop.BeginAnimation(ScaleTransform.ScaleXProperty, a);
+        pop.BeginAnimation(ScaleTransform.ScaleYProperty, a);
     }
 }
 }

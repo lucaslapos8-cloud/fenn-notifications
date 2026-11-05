@@ -29,19 +29,22 @@ os.makedirs(cache, exist_ok=True)
 DEFAULTS = {"popup": True, "seconds": 6, "hide_banners": False,
             "muted": [], "banner_changed": [], "fullscreen": False,
             "style": "tinted", "size": 2, "tint": 0,
-            "photos": True, "pill_badge": 1}
+            "photos": True, "pill_badge": 1, "marker": 1}
 settings = {**DEFAULTS, **(app.load("settings", {}) or {})}
 DURATIONS = [4, 6, 10, 20]
 STYLES = ["solid", "glass", "tinted"]
 STYLE_NAMES = ["Solid", "Glass", "Tinted"]
 SIZE_NAMES = ["XS", "S", "M", "L", "XL"]  # XS is as small as Fenn's own pill
 TINT_NAMES = ["Full", "High", "Medium", "Light"]
-BADGE_NAMES = ["Off", "10 s", "Until read"]  # unread count in Fenn's pill
+BADGE_NAMES = ["Off", "10 s", "Until read"]  # how long the unread marker stays
+MARKERS = ["dot", "count", "fenn"]
+MARKER_NAMES = ["Dot", "Count", "Fenn badge"]  # dot/count sit between the time and the date
 BADGE_HOLD = 10  # Tinted look: same blur, more see-through
 
 notes = []          # newest first: {order, id, aumid, app, icon, image, info, at, unread}
 badge_until = 0.0   # monotonic time the pill's unread badge goes away ("10 s" mode)
 badge_shown = False
+marker_sent = None  # last marker line sent to the bubble process
 showing = None      # the note in the bubble
 last_check = 0.0
 
@@ -87,6 +90,8 @@ class Bubble:
         self.mtime = self._script_mtime()
         self._send_now(f"theme|{'dark' if app.dark else 'light'}|{app.accent}")
         self._send_now(config_line())
+        if marker_sent:
+            self._send_now(marker_sent)  # a restarted bubble process gets the marker back
 
     @staticmethod
     def _script_mtime():
@@ -251,7 +256,11 @@ def page_view():
             fenn.chips("size", SIZE_NAMES, min(4, max(0, int(settings["size"])))),
         ], gap=8, align="center"),
         fenn.row([
-            fenn.text("Unread count in pill", color="dim"),
+            fenn.text("Unread marker", color="dim"),
+            fenn.chips("marker", MARKER_NAMES, min(2, max(0, int(settings.get("marker", 1))))),
+        ], gap=8, align="center"),
+        fenn.row([
+            fenn.text("Show it", color="dim"),
             fenn.chips("pill_badge", BADGE_NAMES, min(2, max(0, int(settings.get("pill_badge", 1))))),
         ], gap=8, align="center"),
         fenn.toggle("photos", settings["photos"], label="Sender photos (Beeper: from its local contact list)"),
@@ -276,15 +285,20 @@ def page_view():
 def draw():
     app.tile(tile_view())
     app.page(page_view(), actions=[{"id": "clear", "icon": "broom", "tooltip": "Clear all"}])
-    global badge_shown
+    global badge_shown, marker_sent
     unread = sum(1 for n in notes if n["unread"])
     mode = settings.get("pill_badge", 1)
-    show = unread and (mode == 2 or (mode == 1 and time.monotonic() < badge_until))
-    if show:
+    show = bool(unread) and (mode == 2 or (mode == 1 and time.monotonic() < badge_until))
+    style = MARKERS[min(2, max(0, int(settings.get("marker", 1))))]
+    if show and style == "fenn":
         app.badge_ring(1.0, str(unread) if unread < 100 else "99+")
     else:
         app.clear_badge()
-    badge_shown = bool(show)
+    line = f"marker|{style if show and style != 'fenn' else 'none'}|{unread}"
+    if line != marker_sent:
+        marker_sent = line
+        bubble.send(line)
+    badge_shown = show
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +453,13 @@ def on_size(e):
     settings["size"] = e["value"]["index"]
     save_settings()
     bubble.send(config_line())
+    draw()
+
+
+@app.on("marker")
+def on_marker(e):
+    settings["marker"] = e["value"]["index"]
+    save_settings()
     draw()
 
 

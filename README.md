@@ -15,8 +15,10 @@ Windows notification.
 - **Sizes:** XS (as small as Fenn's pill, one line), S, M, L, XL.
 - **Sender photos** with a small app icon on them, like on iPhone: taken from
   the notification itself, or for Beeper from its local contact list.
-- **Unread count** in Fenn's pill for 10 seconds after the bubble closes
-  (or off, or until read).
+- **Unread marker** between the time and the date in Fenn's clock pill: a
+  small dot or a count, for 10 seconds after the bubble closes (or off, or
+  until read). It hides while you hover the pill or when the pill shows
+  something other than the clock. Or use Fenn's own badge instead.
 - **History:** the plugin's page in Fenn lists recent notifications, with
   per-app mute switches and the settings.
 - Skips full-screen games, videos and presentations unless you turn that on.
