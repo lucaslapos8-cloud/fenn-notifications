@@ -32,11 +32,19 @@ SETTINGS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Notifications\Setting
 
 
 class NotificationFeed:
-    """Polls wpndatabase.db for toasts newer than the last one seen."""
+    """Polls wpndatabase.db for toasts that arrived since the last poll.
+
+    The table's "Order" column is a plain rowid: once notifications are
+    cleared, Windows hands out the same numbers again, so it can't tell new
+    from old. Arrival time plus the notification Id (which only grows) can."""
+
+    WINDOW = 60 * 10_000_000  # look back 60 s (FILETIME ticks) in case of clock nudges
 
     def __init__(self):
         self.conn = None
-        self.last_order = None
+        self.since = None        # newest ArrivalTime seen
+        self.max_id = 0          # newest notification Id seen
+        self.seen = set()        # (Id, ArrivalTime) already handed out
 
     def _connect(self):
         if self.conn is None:
@@ -44,18 +52,21 @@ class NotificationFeed:
         return self.conn
 
     def poll(self):
-        """New toasts as dicts: order, id, aumid, tag, group, arrival, payload."""
+        """New toasts as dicts: order (a unique key), id, aumid, tag, group,
+        arrival, payload."""
         try:
             c = self._connect()
-            if self.last_order is None:
-                row = c.execute('select max("Order") from Notification').fetchone()
-                self.last_order = row[0] or 0
+            if self.since is None:
+                rows = c.execute("select Id, ArrivalTime from Notification").fetchall()
+                self.seen = {(i, a) for i, a in rows}
+                self.since = max((a or 0 for _, a in rows), default=0)
+                self.max_id = max((i or 0 for i, _ in rows), default=0)
                 return []
             rows = c.execute(
-                'select n."Order", n.Id, h.PrimaryId, n.Tag, n."Group", n.ArrivalTime, n.Payload '
+                'select n.Id, h.PrimaryId, n.Tag, n."Group", n.ArrivalTime, n.Payload '
                 'from Notification n join NotificationHandler h on h.RecordId = n.HandlerId '
-                'where n."Order" > ? and n.Type = \'toast\' order by n."Order"',
-                (self.last_order,),
+                "where n.Type = 'toast' and (n.ArrivalTime >= ? or n.Id > ?) order by n.ArrivalTime",
+                (self.since - self.WINDOW, self.max_id),
             ).fetchall()
         except sqlite3.Error:
             # Busy or recreated by Windows; reconnect next time.
@@ -66,12 +77,20 @@ class NotificationFeed:
                 self.conn = None
             return []
         out = []
-        for order, nid, aumid, tag, group, arrival, payload in rows:
-            self.last_order = max(self.last_order, order)
+        for nid, aumid, tag, group, arrival, payload in rows:
+            key = (nid, arrival)
+            if key in self.seen:
+                continue
+            self.seen.add(key)
+            self.since = max(self.since, arrival or 0)
+            self.max_id = max(self.max_id, nid or 0)
             if isinstance(payload, bytes):
                 payload = payload.decode("utf-8", "replace")
-            out.append({"order": order, "id": nid, "aumid": aumid, "tag": tag or "",
+            out.append({"order": nid, "id": nid, "aumid": aumid, "tag": tag or "",
                         "group": group or "", "arrival": arrival, "payload": payload or ""})
+        if len(self.seen) > 2000:  # keep only what the look-back window can return
+            cutoff = self.since - self.WINDOW * 2
+            self.seen = {k for k in self.seen if (k[1] or 0) >= cutoff or (k[0] or 0) >= self.max_id - 50}
         return out
 
     def still_present(self, nid):
@@ -122,7 +141,7 @@ def parse_toast(payload):
             elif el.tag == "image":
                 src = el.get("src", "")
                 place = el.get("placement", "")
-                if place == "appLogoOverride" and not info["image"]:
+                if (place == "appLogoOverride" or el.get("hint-crop") == "circle") and not info["image"]:
                     info["image"] = src
                 elif place == "hero" or not place:
                     info["hero"] = info["hero"] or src
@@ -191,6 +210,104 @@ def local_image(src, cache_dir):
     except Exception:
         return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# Sender photos for apps whose toasts carry none
+
+BEEPER_DIR = os.path.expandvars(r"%APPDATA%\BeeperTexts")
+BEEPER_AUMIDS = ("com.automattic.beeper.desktop", "com.automattic.beeper")
+_photo_cache = {}  # (aumid, name) -> (path or None, time looked up)
+
+
+def _image_ext(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return None
+    if head[:2] == bytes((0xFF, 0xD8)):
+        return ".jpg"
+    if head[:4] == bytes((0x89,)) + b"PNG":
+        return ".png"
+    if head.startswith(b"GIF8"):
+        return ".gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    return None  # e.g. animated avatars stored as video
+
+
+def _cached_copy(src, cache_dir):
+    """Copies an image to the plugin cache under a proper extension (Fenn and
+    WPF both sniff by extension in places)."""
+    ext = _image_ext(src)
+    if not ext:
+        return None
+    dst = os.path.join(cache_dir, f"av-{zlib.crc32(src.encode()):08x}{ext}")
+    try:
+        if not os.path.isfile(dst) or os.path.getmtime(dst) < os.path.getmtime(src):
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(src, "rb") as a, open(dst + ".tmp", "wb") as b:
+                b.write(a.read(8 * 1024 * 1024))
+            os.replace(dst + ".tmp", dst)
+        return dst
+    except OSError:
+        return None
+
+
+def _mxc_path(url):
+    m = re.match(r"mxc://([^/]+)/([^?#/]+)", url or "")
+    if not m:
+        return None
+    return os.path.join(BEEPER_DIR, "media", m.group(1), m.group(2) + ".avatar")
+
+
+def _beeper_photo(name, cache_dir):
+    db = os.path.join(BEEPER_DIR, "index.db")
+    if not os.path.isfile(db):
+        return None
+    names = [name.strip()]
+    bare = re.sub(r"\s*\([^)]*\)\s*$", "", names[0]).strip()  # "Name (Instagram)" -> "Name"
+    if bare and bare != names[0]:
+        names.append(bare)
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.5)
+    except sqlite3.Error:
+        return None
+    try:
+        for n in names:
+            rows = conn.execute(
+                "select img_url from participants where img_url like 'mxc://%' and "
+                "(full_name = ? collate nocase or nickname = ? collate nocase)", (n, n)).fetchall()
+            for (url,) in rows:
+                src = _mxc_path(url)
+                if src and os.path.isfile(src):
+                    path = _cached_copy(src, cache_dir)
+                    if path:
+                        return path
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return None
+
+
+def sender_photo(aumid, info, cache_dir):
+    """The sender's picture: from the toast itself, or for Beeper from its
+    local contact list (index.db, read-only) and avatar cache. None if unknown."""
+    path = local_image(info.get("image"), cache_dir)
+    if path:
+        ext = _image_ext(path)
+        return path if ext else None
+    if aumid.lower() not in BEEPER_AUMIDS or not info.get("title"):
+        return None
+    key = (aumid, info["title"].strip().lower())
+    hit = _photo_cache.get(key)
+    if hit and (hit[0] or time.time() - hit[1] < 120):  # retry misses later: Beeper may cache the avatar meanwhile
+        return hit[0]
+    path = _beeper_photo(info["title"], cache_dir)
+    _photo_cache[key] = (path, time.time())
+    return path
 
 
 # ---------------------------------------------------------------------------

@@ -28,15 +28,20 @@ os.makedirs(cache, exist_ok=True)
 
 DEFAULTS = {"popup": True, "seconds": 6, "hide_banners": False,
             "muted": [], "banner_changed": [], "fullscreen": False,
-            "style": "tinted", "size": 2, "tint": 0}
+            "style": "tinted", "size": 2, "tint": 0,
+            "photos": True, "pill_badge": 1}
 settings = {**DEFAULTS, **(app.load("settings", {}) or {})}
 DURATIONS = [4, 6, 10, 20]
 STYLES = ["solid", "glass", "tinted"]
 STYLE_NAMES = ["Solid", "Glass", "Tinted"]
 SIZE_NAMES = ["XS", "S", "M", "L", "XL"]  # XS is as small as Fenn's own pill
-TINT_NAMES = ["Full", "High", "Medium", "Light"]  # Tinted look: same blur, more see-through
+TINT_NAMES = ["Full", "High", "Medium", "Light"]
+BADGE_NAMES = ["Off", "10 s", "Until read"]  # unread count in Fenn's pill
+BADGE_HOLD = 10  # Tinted look: same blur, more see-through
 
 notes = []          # newest first: {order, id, aumid, app, icon, image, info, at, unread}
+badge_until = 0.0   # monotonic time the pill's unread badge goes away ("10 s" mode)
+badge_shown = False
 showing = None      # the note in the bubble
 last_check = 0.0
 
@@ -158,8 +163,9 @@ def bubble_buttons(note):
 
 
 def pop(note):
-    global showing
+    global showing, badge_until
     showing = note
+    badge_until = time.monotonic() + settings["seconds"] + BADGE_HOLD
     others = sum(1 for x in notes if x["unread"] and x is not note)
     info = note["info"]
     body = clip(info["body"] or info["attribution"], 220)
@@ -170,6 +176,7 @@ def pop(note):
         "show", str(note["order"]), b64(note["app"]), b64(clip(info["title"], 90)), b64(body),
         b64(note["image"] or note["icon"] or ""), str(others), str(settings["seconds"]), b64(ago(note["at"])),
         b64(hint), b64(labels) if labels else "",
+        b64(note["icon"] if note["image"] and note["icon"] else ""),  # small app icon on the sender's photo
     ]))
 
 
@@ -243,6 +250,11 @@ def page_view():
             fenn.text("Size", color="dim"),
             fenn.chips("size", SIZE_NAMES, min(4, max(0, int(settings["size"])))),
         ], gap=8, align="center"),
+        fenn.row([
+            fenn.text("Unread count in pill", color="dim"),
+            fenn.chips("pill_badge", BADGE_NAMES, min(2, max(0, int(settings.get("pill_badge", 1))))),
+        ], gap=8, align="center"),
+        fenn.toggle("photos", settings["photos"], label="Sender photos (Beeper: from its local contact list)"),
         fenn.toggle("fullscreen", settings["fullscreen"], label="Also pop out over full-screen apps and games"),
         fenn.toggle("hide_banners", settings["hide_banners"],
                     label="Hide Windows banners (show them only here)"),
@@ -264,11 +276,15 @@ def page_view():
 def draw():
     app.tile(tile_view())
     app.page(page_view(), actions=[{"id": "clear", "icon": "broom", "tooltip": "Clear all"}])
+    global badge_shown
     unread = sum(1 for n in notes if n["unread"])
-    if unread:
+    mode = settings.get("pill_badge", 1)
+    show = unread and (mode == 2 or (mode == 1 and time.monotonic() < badge_until))
+    if show:
         app.badge_ring(1.0, str(unread) if unread < 100 else "99+")
     else:
         app.clear_badge()
+    badge_shown = bool(show)
 
 
 # ---------------------------------------------------------------------------
@@ -289,13 +305,15 @@ def ingest(raw):
         "order": raw["order"], "id": raw["id"], "aumid": aumid, "tag": raw["tag"],
         "app": wn.app_name(aumid, feed),
         "icon": wn.app_icon(aumid, cache, feed),
-        "image": wn.local_image(info["image"], cache),
+        "image": wn.sender_photo(aumid, info, cache) if settings["photos"] else wn.local_image(info["image"], cache),
         "info": info, "at": at, "unread": True,
     }
 
 
 def poll():
-    global last_check
+    global last_check, badge_until
+    if badge_shown and settings.get("pill_badge", 1) == 1 and time.monotonic() >= badge_until:
+        draw()  # the 10 s are up: the pill goes back to Fenn's own view
     fresh = []
     for raw in feed.poll():
         if raw["aumid"] in settings["muted"]:
@@ -307,9 +325,10 @@ def poll():
         for n in fresh:
             notes.insert(0, n)
         del notes[60:]
-        draw()
+        badge_until = time.monotonic() + BADGE_HOLD
         if settings["popup"] and (settings["fullscreen"] or not fullscreen_app_running()):
-            pop(fresh[-1])
+            pop(fresh[-1])  # also pushes the badge timer past the bubble's own time
+        draw()
 
     # Toasts dismissed in Windows (or retracted by the app) leave here too.
     now = time.monotonic()
@@ -346,7 +365,7 @@ def open_note(n):
 
 @app.on_message("bubble")
 def on_bubble(msg):
-    global showing
+    global showing, badge_until
     kind, _, arg = msg["line"].partition("|")
     if kind == "click":
         n = find(arg)
@@ -378,6 +397,7 @@ def on_bubble(msg):
             else:
                 app.log(f"{n['app']}: no send action for the reply box", "warn")
     elif kind == "hidden":
+        badge_until = time.monotonic() + BADGE_HOLD  # count from when the bubble went back into the pill
         showing = None
 
 
@@ -419,6 +439,20 @@ def on_size(e):
     settings["size"] = e["value"]["index"]
     save_settings()
     bubble.send(config_line())
+    draw()
+
+
+@app.on("pill_badge")
+def on_pill_badge(e):
+    settings["pill_badge"] = e["value"]["index"]
+    save_settings()
+    draw()
+
+
+@app.on("photos")
+def on_photos(e):
+    settings["photos"] = bool(e.get("value"))
+    save_settings()
     draw()
 
 

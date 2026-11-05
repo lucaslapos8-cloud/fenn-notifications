@@ -13,6 +13,10 @@ Windows notification.
 - **Looks:** Tinted (smoked glass, default) with four tint strengths, Glass,
   or Solid.
 - **Sizes:** XS (as small as Fenn's pill, one line), S, M, L, XL.
+- **Sender photos** with a small app icon on them, like on iPhone: taken from
+  the notification itself, or for Beeper from its local contact list.
+- **Unread count** in Fenn's pill for 10 seconds after the bubble closes
+  (or off, or until read).
 - **History:** the plugin's page in Fenn lists recent notifications, with
   per-app mute switches and the settings.
 - Skips full-screen games, videos and presentations unless you turn that on.
@@ -74,6 +78,11 @@ reach the island either. Turn them back on (banners can stay off).
   notification's picture is a web address (some apps send sender avatars this
   way), the plugin downloads that one image so it can show it, and caches it
   in its data folder.
+- **Sender photos for Beeper:** Beeper's notifications carry no picture, so
+  the plugin looks the sender's name up in Beeper's local database
+  (`%APPDATA%\BeeperTexts\index.db`, read-only, contacts table only) and copies
+  their already-downloaded avatar into its cache. Nothing leaves your PC.
+  Switch off **Sender photos** to skip this.
 - With **Hide Windows banners** on, the plugin writes `ShowBanner` values under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings`, and
   removes them again when you switch it off.

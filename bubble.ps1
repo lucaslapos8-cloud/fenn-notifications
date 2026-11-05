@@ -7,7 +7,7 @@
 # main.py drives it over stdin, one command per line:
 #   theme|dark|#RRGGBB
 #   config|<solid|glass|tinted>|<size 0..4>|<tint 0..3>
-#   show|id|b64 app|b64 title|b64 body|b64 image|more|seconds|b64 when|b64 reply hint|b64 labels (0x1F separated)
+#   show|id|b64 app|b64 title|b64 body|b64 image|more|seconds|b64 when|b64 reply hint|b64 labels (0x1F separated)|b64 app icon badge
 #   hide
 # and it answers on stdout: ready, click|id, dismiss|id, hidden|id,
 # reply|id|b64 text, action|id|index
@@ -44,7 +44,8 @@ public class Bubble : Window {
     readonly Canvas backCanvas;
     readonly Image backdrop;
     readonly Border tintBase, tintColor, sheen;
-    readonly Ellipse avatar, cAvatar;
+    readonly Ellipse avatar, cAvatar, appBadge, cAppBadge;
+    readonly Border appBadgeRing, cAppBadgeRing;
     readonly TextBlock initial, cInitial, appText, whenText, moreText, titleText, bodyText, cText, replyHint;
     readonly TextBox reply;
     readonly StackPanel buttons;
@@ -188,6 +189,12 @@ public class Bubble : Window {
                                   HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
         face.Children.Add(avatar);
         face.Children.Add(initial);
+        // Small app icon on the sender's photo, like iOS.
+        appBadge = new Ellipse { Width = 18, Height = 18 };
+        appBadgeRing = new Border { Width = 22, Height = 22, CornerRadius = new CornerRadius(11), Child = appBadge,
+                                    HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Bottom,
+                                    Margin = new Thickness(0, 0, -4, -4), Visibility = Visibility.Collapsed };
+        face.Children.Add(appBadgeRing);
         mainArea.Children.Add(face);
 
         var text = new StackPanel { Margin = new Thickness(0, 12, 16, 14) };
@@ -267,6 +274,11 @@ public class Bubble : Window {
                                    HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
         cFace.Children.Add(cAvatar);
         cFace.Children.Add(cInitial);
+        cAppBadge = new Ellipse { Width = 9, Height = 9 };
+        cAppBadgeRing = new Border { Width = 11, Height = 11, CornerRadius = new CornerRadius(5.5), Child = cAppBadge,
+                                     HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Bottom,
+                                     Margin = new Thickness(0, 0, -2, -2), Visibility = Visibility.Collapsed };
+        cFace.Children.Add(cAppBadgeRing);
         compact.Children.Add(cFace);
         cText = new TextBlock { FontSize = 12.5, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis, Margin = new Thickness(0, 0, 14, 0) };
         Grid.SetColumn(cText, 1);
@@ -485,7 +497,7 @@ public class Bubble : Window {
 
     // ------------------------------------------------------------------ show / hide
 
-    public void Pop(string id, string app, string title, string body, string image, int more, double seconds, string when, string hint, string[] labels) {
+    public void Pop(string id, string app, string title, string body, string image, int more, double seconds, string when, string hint, string[] labels, string badge) {
         current = id;
         appText.Text = app;
         whenText.Text = when;
@@ -498,6 +510,10 @@ public class Bubble : Window {
         if (!string.IsNullOrEmpty(body)) cText.Inlines.Add(new Run("  " + body.Replace("\n", " ")) { Foreground = bodyText.Foreground });
         if (more > 0) cText.Inlines.Add(new Run("  +" + more) { Foreground = moreText.Foreground, FontWeight = FontWeights.SemiBold });
         SetAvatar(image, app);
+        var badgeBrush = LoadBrush(badge, 48);
+        appBadgeRing.Visibility = cAppBadgeRing.Visibility = badgeBrush != null ? Visibility.Visible : Visibility.Collapsed;
+        appBadge.Fill = cAppBadge.Fill = badgeBrush;
+        appBadgeRing.Background = cAppBadgeRing.Background = dark ? B(0xFF, 0x16, 0x17, 0x1C) : B(0xFF, 0xF4, 0xF4, 0xF6);
 
         // Reply box and the toast's own buttons, revealed on hover.
         replyBox.Visibility = string.IsNullOrEmpty(hint) ? Visibility.Collapsed : Visibility.Visible;
@@ -552,22 +568,25 @@ public class Bubble : Window {
         Fade(FullLayout ? (UIElement)content : compact, 1, 260, 170);
     }
 
+    static ImageBrush LoadBrush(string path, int px) {
+        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+        try {
+            var bmp = new BitmapImage();
+            bmp.BeginInit();
+            bmp.CacheOption = BitmapCacheOption.OnLoad;
+            bmp.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
+            bmp.DecodePixelWidth = px;
+            bmp.UriSource = new Uri(path);
+            bmp.EndInit();
+            bmp.Freeze();
+            return new ImageBrush(bmp) { Stretch = Stretch.UniformToFill };
+        } catch { return null; }
+    }
+
     void SetAvatar(string path, string app) {
         initial.Text = cInitial.Text = "";
-        if (!string.IsNullOrEmpty(path) && File.Exists(path)) {
-            try {
-                var bmp = new BitmapImage();
-                bmp.BeginInit();
-                bmp.CacheOption = BitmapCacheOption.OnLoad;
-                bmp.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
-                bmp.DecodePixelWidth = 96;
-                bmp.UriSource = new Uri(path);
-                bmp.EndInit();
-                var brush = new ImageBrush(bmp) { Stretch = Stretch.UniformToFill };
-                avatar.Fill = brush; cAvatar.Fill = brush;
-                return;
-            } catch { }
-        }
+        var brush = LoadBrush(path, 128);
+        if (brush != null) { avatar.Fill = brush; cAvatar.Fill = brush; return; }
         avatar.Fill = cAvatar.Fill = new SolidColorBrush(accent);
         initial.Text = cInitial.Text = string.IsNullOrEmpty(app) ? "?" : app.Substring(0, 1).ToUpper();
     }
@@ -665,7 +684,7 @@ public class Bubble : Window {
                     double secs; double.TryParse(f[7], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out secs);
                     string hint = f.Length > 9 ? D(f[9]) : "";
                     string[] labels = f.Length > 10 && f[10].Length > 0 ? D(f[10]).Split((char)0x1F) : new string[0];
-                    Pop(f[1], D(f[2]), D(f[3]), D(f[4]), D(f[5]), more, secs, D(f[8]), hint, labels);
+                    Pop(f[1], D(f[2]), D(f[3]), D(f[4]), D(f[5]), more, secs, D(f[8]), hint, labels, f.Length > 11 ? D(f[11]) : "");
                 }
                 break;
             case "hide":
