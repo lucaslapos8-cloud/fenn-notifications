@@ -1,0 +1,514 @@
+"""Notifications: every Windows toast pops out of the island instead of the
+corner of the screen. A small bubble grows out of the pill with the app,
+sender and message, shrinks back into it after a few seconds, and a click
+opens the exact chat or page the toast came from (same as clicking the
+Windows toast).
+
+The bubble is its own little window (bubble.ps1) drawn over Fenn's pill, so
+Fenn itself never opens or pins. The plugin's page, opened from Fenn, lists
+recent notifications and the settings."""
+
+import base64
+import ctypes
+import os
+import subprocess
+import sys
+import threading
+import time
+
+import fenn
+import winnotif as wn
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+app = fenn.Plugin()
+feed = wn.NotificationFeed()
+cache = os.path.join(app.data_dir, "cache")
+os.makedirs(cache, exist_ok=True)
+
+DEFAULTS = {"popup": True, "seconds": 6, "hide_banners": False,
+            "muted": [], "banner_changed": [], "fullscreen": False,
+            "style": "tinted", "size": 2, "tint": 0}
+settings = {**DEFAULTS, **(app.load("settings", {}) or {})}
+DURATIONS = [4, 6, 10, 20]
+STYLES = ["solid", "glass", "tinted"]
+STYLE_NAMES = ["Solid", "Glass", "Tinted"]
+SIZE_NAMES = ["XS", "S", "M", "L", "XL"]  # XS is as small as Fenn's own pill
+TINT_NAMES = ["Full", "High", "Medium", "Light"]  # Tinted look: same blur, more see-through
+
+notes = []          # newest first: {order, id, aumid, app, icon, image, info, at, unread}
+showing = None      # the note in the bubble
+last_check = 0.0
+
+
+def save_settings():
+    app.save("settings", settings)
+
+
+def ago(ts):
+    s = max(0, time.time() - ts)
+    if s < 45:
+        return "now"
+    if s < 3600:
+        return f"{int(s // 60)}m"
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def clip(s, n):
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+# ---------------------------------------------------------------------------
+# The bubble window
+
+
+class Bubble:
+    """Runs bubble.ps1 and talks to it line by line. Restarts it if it dies."""
+
+    def __init__(self):
+        self.proc = None
+        self.lock = threading.Lock()
+
+    def _start(self):
+        log = open(os.path.join(app.data_dir, "bubble.log"), "a", encoding="utf-8")
+        self.proc = subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-STA",
+             "-File", os.path.join(HERE, "bubble.ps1")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+            cwd=HERE, text=True, encoding="ascii", errors="replace", bufsize=1)
+        threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
+        self.mtime = self._script_mtime()
+        self._send_now(f"theme|{'dark' if app.dark else 'light'}|{app.accent}")
+        self._send_now(config_line())
+
+    @staticmethod
+    def _script_mtime():
+        try:
+            return os.path.getmtime(os.path.join(HERE, "bubble.ps1"))
+        except OSError:
+            return 0
+
+    def _read(self, proc):
+        for line in proc.stdout:
+            line = line.strip()
+            if line:
+                app._inbox.put({"type": "bubble", "line": line})
+
+    def _send_now(self, line):
+        try:
+            self.proc.stdin.write(line + "\n")
+            self.proc.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def send(self, line):
+        with self.lock:
+            if self.proc is not None and self.proc.poll() is None and self._script_mtime() != self.mtime:
+                self._send_now("quit")  # bubble.ps1 was edited: start the new one
+                self.proc = None
+            if self.proc is None or self.proc.poll() is not None:
+                self._start()
+            if not self._send_now(line):
+                self._start()
+                self._send_now(line)
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.stdin.write("quit\n")
+                self.proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
+
+
+bubble = Bubble()
+
+
+def config_line():
+    style = settings["style"] if settings["style"] in STYLES else "solid"
+    return (f"config|{style}|{min(4, max(0, int(settings['size'])))}"
+            f"|{min(3, max(0, int(settings.get('tint', 0))))}")
+
+
+def b64(s):
+    return base64.b64encode((s or "").encode("utf-8")).decode("ascii")
+
+
+def fullscreen_app_running():
+    """True while a game, video or presentation is full screen."""
+    state = ctypes.c_int(0)
+    try:
+        ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state))
+    except OSError:
+        return False
+    return state.value in (2, 3, 4)  # busy, D3D full screen, presentation mode
+
+
+def reply_input(note):
+    return next((i for i in note["info"]["inputs"] if i["type"] == "text"), None)
+
+
+def bubble_buttons(note):
+    """The toast's own buttons shown on hover (the reply box has its own send)."""
+    limit = 2 if reply_input(note) else 3
+    return [a for a in note["info"]["actions"] if a["content"] and not a["input"]][:limit]
+
+
+def pop(note):
+    global showing
+    showing = note
+    others = sum(1 for x in notes if x["unread"] and x is not note)
+    info = note["info"]
+    body = clip(info["body"] or info["attribution"], 220)
+    inp = reply_input(note)
+    hint = (inp["hint"] or "Reply") if inp else ""
+    labels = chr(0x1F).join(clip(a["content"], 16) for a in bubble_buttons(note))
+    bubble.send("|".join([
+        "show", str(note["order"]), b64(note["app"]), b64(clip(info["title"], 90)), b64(body),
+        b64(note["image"] or note["icon"] or ""), str(others), str(settings["seconds"]), b64(ago(note["at"])),
+        b64(hint), b64(labels) if labels else "",
+    ]))
+
+
+# ---------------------------------------------------------------------------
+# Fenn views: the tile and the page (history + settings)
+
+
+def avatar(note, size):
+    path = note["image"] or note["icon"]
+    if path:
+        return fenn.image(path=path, width=size, height=size, rounding=size / 2)
+    return fenn.icon("bell", size=size * 0.6, color="accent")
+
+
+def tile_view():
+    unread = [n for n in notes if n["unread"]]
+    if not notes:
+        return fenn.row([
+            fenn.icon("bell", size=22, color="dim"),
+            fenn.column([
+                fenn.text("Notifications", size="small", color="dim", bold=True),
+                fenn.text("All caught up", wrap=False),
+            ], gap=0),
+        ], gap=10, align="center")
+    n = unread[0] if unread else notes[0]
+    head = n["app"] + (f"  ·  {len(unread)} new" if len(unread) > 1 else f"  ·  {ago(n['at'])}")
+    return fenn.row([
+        avatar(n, 32),
+        fenn.column([
+            fenn.text(head, size="small", color="dim", bold=True),
+            fenn.text(clip(n["info"]["title"] or n["app"], 60), bold=True, wrap=False),
+            fenn.text(clip(n["info"]["body"], 70), color="dim", wrap=False),
+        ], gap=0),
+    ], gap=10, align="center")
+
+
+def page_view():
+    parts = []
+    if notes:
+        items = []
+        for n in notes[:40]:
+            title = n["info"]["title"] or n["app"]
+            items.append(fenn.item(f"n:{n['order']}", clip(f"{n['app']}  ·  {title}", 70),
+                                   subtitle=clip(n["info"]["body"], 90) or None,
+                                   icon="dot-outline" if n["unread"] else "bell",
+                                   trailing=ago(n["at"]), selected=n["unread"]))
+        parts.append(fenn.list_view(items))
+    else:
+        parts.append(fenn.text("No notifications. All caught up.", color="faint"))
+
+    parts += [
+        fenn.divider(),
+        fenn.toggle("popup", settings["popup"], label="Pop out of the island when one arrives"),
+        fenn.row([
+            fenn.text("Collapse after", color="dim"),
+            fenn.chips("seconds", [f"{d}s" for d in DURATIONS],
+                       DURATIONS.index(settings["seconds"]) if settings["seconds"] in DURATIONS else 1),
+        ], gap=8, align="center"),
+        fenn.row([
+            fenn.text("Look", color="dim"),
+            fenn.chips("style", STYLE_NAMES, STYLES.index(settings["style"]) if settings["style"] in STYLES else 0),
+        ], gap=8, align="center"),
+    ]
+    if settings["style"] == "tinted":
+        parts.append(fenn.row([
+            fenn.text("Tint", color="dim"),
+            fenn.chips("tint", TINT_NAMES, min(3, max(0, int(settings.get("tint", 0))))),
+        ], gap=8, align="center"))
+    parts += [
+        fenn.row([
+            fenn.text("Size", color="dim"),
+            fenn.chips("size", SIZE_NAMES, min(4, max(0, int(settings["size"])))),
+        ], gap=8, align="center"),
+        fenn.toggle("fullscreen", settings["fullscreen"], label="Also pop out over full-screen apps and games"),
+        fenn.toggle("hide_banners", settings["hide_banners"],
+                    label="Hide Windows banners (show them only here)"),
+        fenn.text("Turns off “Show notification banners” for each app in Windows; they still go to "
+                  "the notification center. Switching this off puts the banners back. If an app keeps "
+                  "showing banners, sign out and in once, or turn on Do not disturb.",
+                  size="small", color="faint", wrap=True),
+    ]
+    apps = {n["aumid"]: n["app"] for n in notes}
+    for aumid in settings["muted"]:
+        apps.setdefault(aumid, wn.app_name(aumid, feed))
+    if apps:
+        parts.append(fenn.text("Apps", size="small", color="dim", bold=True))
+        for aumid, name in sorted(apps.items(), key=lambda kv: kv[1].lower()):
+            parts.append(fenn.toggle(f"app:{aumid}", aumid not in settings["muted"], label=name))
+    return fenn.column(parts, gap=8, scroll=True)
+
+
+def draw():
+    app.tile(tile_view())
+    app.page(page_view(), actions=[{"id": "clear", "icon": "broom", "tooltip": "Clear all"}])
+    unread = sum(1 for n in notes if n["unread"])
+    if unread:
+        app.badge_ring(1.0, str(unread) if unread < 100 else "99+")
+    else:
+        app.clear_badge()
+
+
+# ---------------------------------------------------------------------------
+# Incoming
+
+
+def ingest(raw):
+    aumid = raw["aumid"]
+    info = wn.parse_toast(raw["payload"])
+    if not (info["title"] or info["body"]):
+        return None
+    at = wn.filetime_to_unix(raw["arrival"]) if raw["arrival"] else time.time()
+    if at > time.time() + 60 or at < time.time() - 86400:
+        at = time.time()
+    if settings["hide_banners"]:
+        hide_banner_for(aumid)
+    return {
+        "order": raw["order"], "id": raw["id"], "aumid": aumid, "tag": raw["tag"],
+        "app": wn.app_name(aumid, feed),
+        "icon": wn.app_icon(aumid, cache, feed),
+        "image": wn.local_image(info["image"], cache),
+        "info": info, "at": at, "unread": True,
+    }
+
+
+def poll():
+    global last_check
+    fresh = []
+    for raw in feed.poll():
+        if raw["aumid"] in settings["muted"]:
+            continue
+        note = ingest(raw)
+        if note:
+            fresh.append(note)
+    if fresh:
+        for n in fresh:
+            notes.insert(0, n)
+        del notes[60:]
+        draw()
+        if settings["popup"] and (settings["fullscreen"] or not fullscreen_app_running()):
+            pop(fresh[-1])
+
+    # Toasts dismissed in Windows (or retracted by the app) leave here too.
+    now = time.monotonic()
+    if now - last_check > 3:
+        last_check = now
+        gone = [n for n in notes if n["unread"] and not feed.still_present(n["id"])]
+        if gone:
+            for n in gone:
+                n["unread"] = False
+            if showing in gone:
+                bubble.send("hide")
+            draw()
+
+
+def find(order):
+    try:
+        order = int(order)
+    except ValueError:
+        return None
+    return next((x for x in notes if x["order"] == order), None)
+
+
+def run_action(n, action, inputs=None):
+    n["unread"] = False
+    wn.activate(n["aumid"], action["arguments"], action["activation"], inputs or {}, log=app.log)
+    draw()
+
+
+def open_note(n):
+    n["unread"] = False
+    wn.activate(n["aumid"], wn.click_arguments(n), n["info"]["activation"], log=app.log)
+    draw()
+
+
+@app.on_message("bubble")
+def on_bubble(msg):
+    global showing
+    kind, _, arg = msg["line"].partition("|")
+    if kind == "click":
+        n = find(arg)
+        if n:
+            open_note(n)
+    elif kind == "dismiss":
+        n = find(arg)
+        if n:
+            n["unread"] = False
+            draw()
+    elif kind == "action":
+        oid, _, idx = arg.partition("|")
+        n = find(oid)
+        if n:
+            buttons = bubble_buttons(n)
+            if idx.isdigit() and int(idx) < len(buttons):
+                run_action(n, buttons[int(idx)])
+    elif kind == "reply":
+        oid, _, text = arg.partition("|")
+        n = find(oid)
+        inp = reply_input(n) if n else None
+        if n and inp:
+            text = base64.b64decode(text).decode("utf-8", "replace")
+            acts = n["info"]["actions"]
+            act = (next((a for a in acts if a["input"] == inp["id"]), None)
+                   or next((a for a in acts if "reply" in (a["arguments"] + a["content"]).lower()), None))
+            if act:
+                run_action(n, act, {inp["id"]: text})
+            else:
+                app.log(f"{n['app']}: no send action for the reply box", "warn")
+    elif kind == "hidden":
+        showing = None
+
+
+# ---------------------------------------------------------------------------
+# Page controls
+
+
+@app.on("clear")
+def on_clear(e):
+    notes.clear()
+    draw()
+
+
+@app.on("popup")
+def on_popup(e):
+    settings["popup"] = bool(e.get("value"))
+    save_settings()
+    draw()
+
+
+@app.on("style")
+def on_style(e):
+    settings["style"] = STYLES[e["value"]["index"]]
+    save_settings()
+    bubble.send(config_line())
+    draw()
+
+
+@app.on("tint")
+def on_tint(e):
+    settings["tint"] = e["value"]["index"]
+    save_settings()
+    bubble.send(config_line())
+    draw()
+
+
+@app.on("size")
+def on_size(e):
+    settings["size"] = e["value"]["index"]
+    save_settings()
+    bubble.send(config_line())
+    draw()
+
+
+@app.on("fullscreen")
+def on_fullscreen(e):
+    settings["fullscreen"] = bool(e.get("value"))
+    save_settings()
+    draw()
+
+
+@app.on("seconds")
+def on_seconds(e):
+    settings["seconds"] = DURATIONS[e["value"]["index"]]
+    save_settings()
+    draw()
+
+
+@app.on("hide_banners")
+def on_hide_banners(e):
+    settings["hide_banners"] = bool(e.get("value"))
+    if settings["hide_banners"]:
+        for aumid in wn.known_apps():
+            hide_banner_for(aumid)
+    else:
+        for aumid in settings["banner_changed"]:
+            wn.set_banner(aumid, True)
+        settings["banner_changed"] = []
+    save_settings()
+    draw()
+
+
+def hide_banner_for(aumid):
+    if aumid in settings["banner_changed"] or wn.banner_state(aumid) == 0:
+        return
+    if wn.set_banner(aumid, False):
+        settings["banner_changed"].append(aumid)
+        save_settings()
+
+
+@app.on_message("event")
+def on_event(e):
+    eid = e.get("id", "")
+    if eid.startswith("n:"):
+        n = find(eid[2:])
+        if n:
+            open_note(n)
+            app.close_page()
+    elif eid.startswith("app:"):
+        aumid = eid[4:]
+        muted = settings["muted"]
+        if e.get("value"):
+            if aumid in muted:
+                muted.remove(aumid)
+        elif aumid not in muted:
+            muted.append(aumid)
+        save_settings()
+        draw()
+
+
+@app.on_message("page_open")
+def on_page_open(msg):
+    for n in notes:
+        n["unread"] = False
+    draw()
+
+
+@app.on_message("theme")
+def on_theme(msg):
+    bubble.send(f"theme|{'dark' if app.dark else 'light'}|{app.accent}")
+    draw()
+
+
+@app.on_message("hello")
+def on_hello(msg):
+    bubble.send(f"theme|{'dark' if app.dark else 'light'}|{app.accent}")
+
+
+@app.on_message("shutdown")
+def on_shutdown(msg):
+    bubble.stop()
+
+
+threading.Thread(target=wn._shortcut_activators, daemon=True).start()  # warm the click path
+threading.Thread(target=lambda: bubble.send("hide"), daemon=True).start()  # start the window early
+
+app.every(0.35, poll)
+app.every(30, draw)  # keeps "2m ago" labels fresh
+poll()  # sets the starting point; old toasts are not replayed
+draw()
+try:
+    app.run()
+finally:
+    bubble.stop()

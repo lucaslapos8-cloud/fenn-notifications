@@ -1,0 +1,12 @@
+# Windows notifications in the island: a small bubble grows out of the pill
+# (its own overlay window, so Fenn never opens or pins), shrinks back after a
+# few seconds, and a click opens the chat it came from. Python + PowerShell.
+id = "notifications"
+name = "Notifications"
+icon = "bell"
+size = "wide"
+run = ["python", "main.py"]
+page_size = [460, 260]
+description = "Windows notifications pop out of the island instead of the screen corner. Click one to open the chat it came from."
+author = "Lujlap"
+version = "1.1.0"
