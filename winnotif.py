@@ -237,19 +237,35 @@ def _image_ext(path):
     return None  # e.g. animated avatars stored as video
 
 
-def _cached_copy(src, cache_dir):
-    """Copies an image to the plugin cache under a proper extension (Fenn and
-    WPF both sniff by extension in places)."""
+def _cached_copy(src, cache_dir, px=64):
+    """A small square PNG of an image, in the plugin cache. Fenn lays an image
+    out at its real pixel size, so a 200 px avatar would stretch a 40 pt row;
+    Windows' own thumbnailer shrinks it (and takes files without an extension,
+    like Beeper's .avatar, once they are copied under the right one)."""
     ext = _image_ext(src)
     if not ext:
         return None
-    dst = os.path.join(cache_dir, f"av-{zlib.crc32(src.encode()):08x}{ext}")
+    dst = os.path.join(cache_dir, f"av-{zlib.crc32(src.encode()):08x}-{px}.png")
     try:
-        if not os.path.isfile(dst) or os.path.getmtime(dst) < os.path.getmtime(src):
-            os.makedirs(cache_dir, exist_ok=True)
-            with open(src, "rb") as a, open(dst + ".tmp", "wb") as b:
+        if os.path.isfile(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
+            return dst
+        os.makedirs(cache_dir, exist_ok=True)
+        named = src
+        if not src.lower().endswith(ext):
+            named = os.path.join(cache_dir, f"src-{zlib.crc32(src.encode()):08x}{ext}")
+            with open(src, "rb") as a, open(named, "wb") as b:
                 b.write(a.read(8 * 1024 * 1024))
-            os.replace(dst + ".tmp", dst)
+        data = _shell_png(os.path.abspath(named), px, 0x8)  # THUMBNAILONLY, fitted to px
+        if named != src:
+            try:
+                os.remove(named)
+            except OSError:
+                pass
+        if not data:
+            return None
+        with open(dst + ".tmp", "wb") as f:
+            f.write(data)
+        os.replace(dst + ".tmp", dst)
         return dst
     except OSError:
         return None
@@ -297,8 +313,7 @@ def sender_photo(aumid, info, cache_dir):
     local contact list (index.db, read-only) and avatar cache. None if unknown."""
     path = local_image(info.get("image"), cache_dir)
     if path:
-        ext = _image_ext(path)
-        return path if ext else None
+        return _cached_copy(path, cache_dir)
     if aumid.lower() not in BEEPER_AUMIDS or not info.get("title"):
         return None
     key = (aumid, info["title"].strip().lower())
@@ -575,6 +590,30 @@ def _hbitmap_png(hbm):
             r, g, b = min(255, r * 255 // a), min(255, g * 255 // a), min(255, b * 255 // a)
         px[i], px[i + 1], px[i + 2], px[i + 3] = r, g, b, a
     return _png(w, h, bytes(px))
+
+
+def _shell_png(parsing_name, px, flags):
+    """PNG bytes of the shell's image for a path or shell: name, at most px
+    square (flag 0x1 lets icons come back bigger), or None."""
+    com_init()
+    factory = ctypes.c_void_p()
+    try:
+        shell32.SHCreateItemFromParsingName(
+            ctypes.c_wchar_p(parsing_name), None,
+            ctypes.byref(guid(IID_IShellItemImageFactory)), ctypes.byref(factory))
+    except OSError:
+        return None
+    hbm = wt.HANDLE()
+    try:
+        method(factory, 3, [SIZE, ctypes.c_int, ctypes.POINTER(wt.HANDLE)])(
+            factory, SIZE(px, px), flags, ctypes.byref(hbm))
+        return _hbitmap_png(hbm)
+    except OSError:
+        return None
+    finally:
+        if hbm:
+            gdi32.DeleteObject(hbm)
+        release(factory)
 
 
 def app_icon(aumid, cache_dir, feed=None):
