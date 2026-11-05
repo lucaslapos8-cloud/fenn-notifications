@@ -9,4 +9,4 @@ run = ["python", "main.py"]
 page_size = [460, 260]
 description = "Windows notifications pop out of the island instead of the screen corner. Click one to open the chat it came from."
 author = "Lujlap"
-version = "1.5.0"
+version = "1.2.0"

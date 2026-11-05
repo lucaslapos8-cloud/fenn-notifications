@@ -19,8 +19,10 @@ Windows notification.
   small dot or a count, for 10 seconds after the bubble closes (or off, or
   until read). It hides while you hover the pill or when the pill shows
   something other than the clock. Or use Fenn's own badge instead.
-- **History:** the plugin's page in Fenn lists recent notifications, with
-  per-app mute switches and the settings.
+- **History** like a messages list: one row per sender with their photo, the
+  latest message, the time (now, 5m, Yesterday, ...) and an unread dot. Click
+  the arrow on a row to see that sender's older messages; click any message to
+  open the chat. Per-app mute switches and all settings are below the list.
 - Skips full-screen games, videos and presentations unless you turn that on.
 - Notifications you dismiss in Windows disappear here too.
 
@@ -102,3 +104,16 @@ reach the island either. Turn them back on (banners can stay off).
 
 MIT, see [LICENSE](LICENSE). `fenn.py` is Fenn's plugin helper (MIT, © The
 Nook contributors).
+
+## Changelog
+
+**1.2.0**
+- Fixed: notifications stopped popping up after Windows cleared old ones.
+- Sender photos with a small app icon (Beeper photos from its local contacts).
+- Unread marker (dot or count) between the time and the date in the pill,
+  clearing after 10 seconds (or off, or until read).
+- History redesigned as a messages list with expandable conversations.
+- Tinted look with four strengths; stronger, smoother blur.
+
+**1.1.0**
+- First release.
