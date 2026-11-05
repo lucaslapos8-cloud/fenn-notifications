@@ -283,8 +283,9 @@ def conversation_row(latest, group, last):
     ]
     if not last:
         shapes.append(fenn.line([[2, ROW_H - 0.5], [w, ROW_H - 0.5]], color="faint", width=0.5))
-    dot = (fenn.icon("circle", size=9, color="accent", fill=True) if unread
-           else fenn.spacer(9))
+    # A fixed 10x10 canvas, empty when read: a spacer here grows tall in Fenn's
+    # rows and pushes the whole row down.
+    dot = fenn.canvas(10, [fenn.circle(5, 5, 4.5, fill="accent")] if unread else [], width=10)
     return fenn.row([
         dot,
         avatar(latest, 40),
