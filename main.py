@@ -249,26 +249,48 @@ def tile_view():
     ], gap=10, align="center")
 
 
-def conversation_row(latest, group):
-    """One messages-list row: unread dot, round photo, then name, latest
-    message and time. The list row is Fenn's clickable surface."""
+ROW_H = 50          # one conversation row, in points
+page_width = 536    # updated from Fenn's layout message
+
+
+def fit(text, width, size):
+    """Cuts text to roughly fit `width` points at font `size` (no measuring
+    API in a plugin, so this uses an average glyph width)."""
+    text = " ".join((text or "").split())
+    chars = max(4, int(width / (size * 0.52)))
+    return text if len(text) <= chars else text[: chars - 1].rstrip() + "\u2026"
+
+
+def conversation_row(latest, group, last):
+    """One messages-list row: unread dot, round photo, then a canvas with the
+    name, latest message and time. A canvas has a fixed height (a list would
+    stretch and push the photo out of line) and its clicks open the chat."""
     unread = sum(1 for n in group if n["unread"])
     name = latest["info"]["title"] or latest["app"]
     message = latest["info"]["body"] or latest["info"]["attribution"]
-    if len(group) > 1 and unread > 1:
-        message = f"{unread} new  ·  {message}"
-    # With a sender photo the app isn't visible any more, so name it by the time.
+    if unread > 1:
+        message = f"{unread} new  \u00b7  {message}"
     when = list_time(latest["at"])
-    trailing = f"{latest['app']}  ·  {when}" if latest["image"] else when
+    # With a sender photo the app isn't visible any more, so name it by the time.
+    trailing = f"{latest['app']}  \u00b7  {when}" if latest["image"] else when
+
+    w = max(160, page_width - 9 - 40 - 2 * 10 - 14)  # dot, photo, gaps, scrollbar
+    time_w = len(trailing) * 11.5 * 0.55 + 12
+    shapes = [
+        fenn.label(2, 17, fit(name, w - time_w - 6, 14.5), size=14.5, bold=True, color="text"),
+        fenn.label(w - 2, 17, trailing, size=11.5, color="accent" if unread else "faint", anchor="end"),
+        fenn.label(2, 36, fit(message, w - 8, 12.5), size=12.5, color="dim"),
+    ]
+    if not last:
+        shapes.append(fenn.line([[2, ROW_H - 0.5], [w, ROW_H - 0.5]], color="faint", width=0.5))
     dot = (fenn.icon("circle", size=9, color="accent", fill=True) if unread
            else fenn.spacer(9))
     return fenn.row([
         dot,
         avatar(latest, 40),
-        fenn.list_view([fenn.item(f"n:{latest['order']}", clip(name, 40),
-                                  subtitle=clip(message, 80) or None,
-                                  trailing=trailing, selected=bool(unread))]),
-    ], gap=8, align="center")
+        fenn.canvas(ROW_H, shapes, width=w, id=f"n:{latest['order']}",
+                    tooltip="Open in " + latest["app"]),
+    ], gap=10, align="center")
 
 
 def page_view():
@@ -276,7 +298,7 @@ def page_view():
     if notes:
         convs = conversations()[:30]
         for i, (latest, group) in enumerate(convs):
-            parts.append(conversation_row(latest, group))
+            parts.append(conversation_row(latest, group, i == len(convs) - 1))
     else:
         parts.append(fenn.column([
             fenn.icon("bell", size=28, color="faint"),
@@ -600,6 +622,14 @@ def on_page_close(msg):
     if any(n["unread"] for n in notes):
         for n in notes:
             n["unread"] = False
+        draw()
+
+
+@app.on_message("layout")
+def on_layout(msg):
+    global page_width
+    if msg.get("target") == "page" and msg.get("width") and abs(msg["width"] - page_width) > 1:
+        page_width = msg["width"]
         draw()
 
 
