@@ -80,12 +80,16 @@ def list_time(ts):
     return time.strftime("%d %b", t).lstrip("0")
 
 
+def conv_key(n):
+    return (n["aumid"], (n["info"]["title"] or n["app"]).strip().lower())
+
+
 def conversations():
     """Notifications grouped by app + sender, newest group first, like a
     messages list: [(latest note, all notes in the group)]."""
     groups, order = {}, []
     for n in notes:  # notes are newest first
-        key = (n["aumid"], (n["info"]["title"] or n["app"]).strip().lower())
+        key = conv_key(n)
         if key not in groups:
             groups[key] = []
             order.append(key)
@@ -250,6 +254,10 @@ def tile_view():
 
 
 ROW_H = 46          # one conversation row, in points (photo is 40)
+LINE_H = 24         # one older message under an expanded row
+CHEVRON_W = 46      # right part of a row that expands it instead of opening
+expanded = set()    # conversation keys whose older messages are shown
+row_width = 400     # canvas width of the rows, for hit-testing the chevron
 page_width = 536    # updated from Fenn's layout message
 
 
@@ -262,6 +270,40 @@ def fit(text, width, size):
 
 
 def conversation_row(latest, group, last):
+    """The header row, plus the older messages when it's expanded."""
+    many = len(group) > 1
+    open_ = many and conv_key(latest) in expanded
+    rows = [header_row(latest, group, last or open_, many, open_)]
+    if open_:
+        older = group[1:11]
+        lines = [older_line(n, last_one=(i == len(older) - 1 and not last)) for i, n in enumerate(older)]
+        if len(group) > 11:
+            lines.append(fenn.row([fenn.canvas(LINE_H, [], width=60),
+                                   fenn.canvas(LINE_H, [fenn.label(2, 11, f"+{len(group) - 11} older", size=11.5, color="faint")],
+                                               width=row_width)], gap=10))
+        rows.append(fenn.column(lines, gap=0))
+    return fenn.column(rows, gap=2) if len(rows) > 1 else rows[0]
+
+
+def older_line(n, last_one):
+    """One older message, indented under the name; clicking opens the chat."""
+    text = n["info"]["body"] or n["info"]["title"] or n["app"]
+    when = list_time(n["at"])
+    w = row_width
+    shapes = [
+        fenn.label(2, 11, fit(text, w - len(when) * 6.5 - 16, 12.5), size=12.5,
+                   color="text" if n["unread"] else "dim"),
+        fenn.label(w - 2, 11, when, size=11, color="faint", anchor="end"),
+    ]
+    if last_one:
+        shapes.append(fenn.line([[2, LINE_H - 0.5], [w, LINE_H - 0.5]], color="faint", width=0.5))
+    # 60 + the row gap lines the text up with the name above (dot, photo, gaps).
+    return fenn.row([fenn.canvas(LINE_H, [], width=60),
+                     fenn.canvas(LINE_H, shapes, width=w, id=f"n:{n['order']}",
+                                 tooltip="Open in " + n["app"])], gap=10)
+
+
+def header_row(latest, group, last, many, open_):
     """One messages-list row: unread dot, round photo, then a canvas with the
     name, latest message and time. A canvas has a fixed height (a list would
     stretch and push the photo out of line) and its clicks open the chat."""
@@ -274,15 +316,22 @@ def conversation_row(latest, group, last):
     # With a sender photo the app isn't visible any more, so name it by the time.
     trailing = f"{latest['app']}  \u00b7  {when}" if latest["image"] else when
 
+    global row_width
     w = max(160, page_width - 9 - 40 - 2 * 10 - 14)  # dot, photo, gaps, scrollbar
+    row_width = w
     time_w = len(trailing) * 11.5 * 0.55 + 12
+    msg_w = w - 8 - (CHEVRON_W if many else 0)
     shapes = [
         # Rows are top-aligned (a centred row in Fenn takes all the height it
         # can get), so the text is placed to sit level with the 40 pt photo.
         fenn.label(2, 11, fit(name, w - time_w - 6, 14.5), size=14.5, bold=True, color="text"),
         fenn.label(w - 2, 11, trailing, size=11.5, color="accent" if unread else "faint", anchor="end"),
-        fenn.label(2, 30, fit(message, w - 8, 12.5), size=12.5, color="dim"),
+        fenn.label(2, 30, fit(message, msg_w, 12.5), size=12.5, color="dim"),
     ]
+    if many:
+        # How many, and a chevron that opens the older ones (clicks here don't open the chat).
+        shapes.append(fenn.label(w - 22, 30, str(len(group)), size=11.5, color="faint", anchor="end"))
+        shapes.append(fenn.glyph(w - 10, 30, "caret-up" if open_ else "caret-down", size=13, color="dim"))
     if not last:
         shapes.append(fenn.line([[2, ROW_H - 0.5], [w, ROW_H - 0.5]], color="faint", width=0.5))
     # A fixed 10x10 canvas, empty when read: a spacer here grows tall in Fenn's
@@ -292,7 +341,7 @@ def conversation_row(latest, group, last):
         dot,
         avatar(latest, 40),
         fenn.canvas(ROW_H, shapes, width=w, id=f"n:{latest['order']}",
-                    tooltip="Open in " + latest["app"]),
+                    tooltip=("Open in " + latest["app"]) + ("  \u00b7  arrow shows older messages" if many else "")),
     ], gap=10)
 
 
@@ -595,11 +644,20 @@ def on_event(e):
     eid = e.get("id", "")
     if eid.startswith("n:"):
         n = find(eid[2:])
+        value = e.get("value") if isinstance(e.get("value"), dict) else e
+        x = value.get("x") if isinstance(value, dict) else None
+        convs = conversations()
+        header = next(((l, g) for l, g in convs if l is n), None)
+        if n and header and len(header[1]) > 1 and x is not None and x >= row_width - CHEVRON_W:
+            key = conv_key(n)  # the chevron: show or hide the older messages
+            expanded.symmetric_difference_update({key})
+            draw()
+            return
         if n:
-            for latest, group in conversations():
-                if latest is n:
-                    for x in group:
-                        x["unread"] = False
+            for latest, group in convs:
+                if n in group:
+                    for m in group:
+                        m["unread"] = False
             open_note(n)
             app.close_page()
     elif eid.startswith("app:"):
