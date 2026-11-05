@@ -249,7 +249,7 @@ def tile_view():
     ], gap=10, align="center")
 
 
-ROW_H = 50          # one conversation row, in points
+ROW_H = 46          # one conversation row, in points (photo is 40)
 page_width = 536    # updated from Fenn's layout message
 
 
@@ -277,21 +277,23 @@ def conversation_row(latest, group, last):
     w = max(160, page_width - 9 - 40 - 2 * 10 - 14)  # dot, photo, gaps, scrollbar
     time_w = len(trailing) * 11.5 * 0.55 + 12
     shapes = [
-        fenn.label(2, 17, fit(name, w - time_w - 6, 14.5), size=14.5, bold=True, color="text"),
-        fenn.label(w - 2, 17, trailing, size=11.5, color="accent" if unread else "faint", anchor="end"),
-        fenn.label(2, 36, fit(message, w - 8, 12.5), size=12.5, color="dim"),
+        # Rows are top-aligned (a centred row in Fenn takes all the height it
+        # can get), so the text is placed to sit level with the 40 pt photo.
+        fenn.label(2, 11, fit(name, w - time_w - 6, 14.5), size=14.5, bold=True, color="text"),
+        fenn.label(w - 2, 11, trailing, size=11.5, color="accent" if unread else "faint", anchor="end"),
+        fenn.label(2, 30, fit(message, w - 8, 12.5), size=12.5, color="dim"),
     ]
     if not last:
         shapes.append(fenn.line([[2, ROW_H - 0.5], [w, ROW_H - 0.5]], color="faint", width=0.5))
     # A fixed 10x10 canvas, empty when read: a spacer here grows tall in Fenn's
     # rows and pushes the whole row down.
-    dot = fenn.canvas(10, [fenn.circle(5, 5, 4.5, fill="accent")] if unread else [], width=10)
+    dot = fenn.canvas(40, [fenn.circle(5, 20, 4.5, fill="accent")] if unread else [], width=10)
     return fenn.row([
         dot,
         avatar(latest, 40),
         fenn.canvas(ROW_H, shapes, width=w, id=f"n:{latest['order']}",
                     tooltip="Open in " + latest["app"]),
-    ], gap=10, align="center")
+    ], gap=10)
 
 
 def page_view():
@@ -314,30 +316,30 @@ def page_view():
             fenn.text("Collapse after", color="dim"),
             fenn.chips("seconds", [f"{d}s" for d in DURATIONS],
                        DURATIONS.index(settings["seconds"]) if settings["seconds"] in DURATIONS else 1),
-        ], gap=8, align="center"),
+        ], gap=8),
         fenn.row([
             fenn.text("Look", color="dim"),
             fenn.chips("style", STYLE_NAMES, STYLES.index(settings["style"]) if settings["style"] in STYLES else 0),
-        ], gap=8, align="center"),
+        ], gap=8),
     ]
     if settings["style"] == "tinted":
         parts.append(fenn.row([
             fenn.text("Tint", color="dim"),
             fenn.chips("tint", TINT_NAMES, min(3, max(0, int(settings.get("tint", 0))))),
-        ], gap=8, align="center"))
+        ], gap=8))
     parts += [
         fenn.row([
             fenn.text("Size", color="dim"),
             fenn.chips("size", SIZE_NAMES, min(4, max(0, int(settings["size"])))),
-        ], gap=8, align="center"),
+        ], gap=8),
         fenn.row([
             fenn.text("Unread marker", color="dim"),
             fenn.chips("marker", MARKER_NAMES, min(2, max(0, int(settings.get("marker", 1))))),
-        ], gap=8, align="center"),
+        ], gap=8),
         fenn.row([
             fenn.text("Show it", color="dim"),
             fenn.chips("pill_badge", BADGE_NAMES, min(2, max(0, int(settings.get("pill_badge", 1))))),
-        ], gap=8, align="center"),
+        ], gap=8),
         fenn.toggle("photos", settings["photos"], label="Sender photos (Beeper: from its local contact list)"),
         fenn.toggle("fullscreen", settings["fullscreen"], label="Also pop out over full-screen apps and games"),
         fenn.toggle("hide_banners", settings["hide_banners"],
