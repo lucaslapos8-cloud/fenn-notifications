@@ -62,6 +62,37 @@ def ago(ts):
     return time.strftime("%H:%M", time.localtime(ts))
 
 
+def list_time(ts):
+    """Apple-style: now, 5m, 14:05 today, Yesterday, a weekday this week, else a date."""
+    s = max(0, time.time() - ts)
+    if s < 45:
+        return "now"
+    if s < 3600:
+        return f"{int(s // 60)}m"
+    t, today = time.localtime(ts), time.localtime()
+    days = (time.mktime(today[:3] + (0, 0, 0, 0, 0, -1)) - time.mktime(t[:3] + (0, 0, 0, 0, 0, -1))) / 86400
+    if days < 0.5:
+        return time.strftime("%H:%M", t)
+    if days < 1.5:
+        return "Yesterday"
+    if days < 6.5:
+        return time.strftime("%A", t)
+    return time.strftime("%d %b", t).lstrip("0")
+
+
+def conversations():
+    """Notifications grouped by app + sender, newest group first, like a
+    messages list: [(latest note, all notes in the group)]."""
+    groups, order = {}, []
+    for n in notes:  # notes are newest first
+        key = (n["aumid"], (n["info"]["title"] or n["app"]).strip().lower())
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(n)
+    return [(groups[k][0], groups[k]) for k in order]
+
+
 def clip(s, n):
     s = " ".join((s or "").split())
     return s if len(s) <= n else s[: n - 1].rstrip() + "…"
@@ -218,19 +249,40 @@ def tile_view():
     ], gap=10, align="center")
 
 
+def conversation_row(latest, group):
+    """One messages-list row: unread dot, round photo, then name, latest
+    message and time. The list row is Fenn's clickable surface."""
+    unread = sum(1 for n in group if n["unread"])
+    name = latest["info"]["title"] or latest["app"]
+    message = latest["info"]["body"] or latest["info"]["attribution"]
+    if len(group) > 1 and unread > 1:
+        message = f"{unread} new  ·  {message}"
+    # With a sender photo the app isn't visible any more, so name it by the time.
+    when = list_time(latest["at"])
+    trailing = f"{latest['app']}  ·  {when}" if latest["image"] else when
+    dot = (fenn.icon("circle", size=9, color="accent", fill=True) if unread
+           else fenn.spacer(9))
+    return fenn.row([
+        dot,
+        avatar(latest, 40),
+        fenn.list_view([fenn.item(f"n:{latest['order']}", clip(name, 40),
+                                  subtitle=clip(message, 80) or None,
+                                  trailing=trailing, selected=bool(unread))]),
+    ], gap=8, align="center")
+
+
 def page_view():
     parts = []
     if notes:
-        items = []
-        for n in notes[:40]:
-            title = n["info"]["title"] or n["app"]
-            items.append(fenn.item(f"n:{n['order']}", clip(f"{n['app']}  ·  {title}", 70),
-                                   subtitle=clip(n["info"]["body"], 90) or None,
-                                   icon="dot-outline" if n["unread"] else "bell",
-                                   trailing=ago(n["at"]), selected=n["unread"]))
-        parts.append(fenn.list_view(items))
+        convs = conversations()[:30]
+        for i, (latest, group) in enumerate(convs):
+            parts.append(conversation_row(latest, group))
     else:
-        parts.append(fenn.text("No notifications. All caught up.", color="faint"))
+        parts.append(fenn.column([
+            fenn.icon("bell", size=28, color="faint"),
+            fenn.text("No notifications", bold=True),
+            fenn.text("You're all caught up.", color="faint"),
+        ], gap=4, align="center"))
 
     parts += [
         fenn.divider(),
@@ -519,6 +571,10 @@ def on_event(e):
     if eid.startswith("n:"):
         n = find(eid[2:])
         if n:
+            for latest, group in conversations():
+                if latest is n:
+                    for x in group:
+                        x["unread"] = False
             open_note(n)
             app.close_page()
     elif eid.startswith("app:"):
@@ -535,9 +591,16 @@ def on_event(e):
 
 @app.on_message("page_open")
 def on_page_open(msg):
-    for n in notes:
-        n["unread"] = False
-    draw()
+    draw()  # unread dots stay visible while you look
+
+
+@app.on_message("page_close")
+def on_page_close(msg):
+    # Seen now: clear the dots (and the pill marker) once the page closes.
+    if any(n["unread"] for n in notes):
+        for n in notes:
+            n["unread"] = False
+        draw()
 
 
 @app.on_message("theme")
