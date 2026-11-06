@@ -40,8 +40,12 @@ DEFAULTS = {"popup": True, "seconds": 6, "hide_banners": False,
             "photos": True, "pill_badge": 1, "marker": 1,
             "sound_on": False, "sound": "b:message", "volume": 70, "app_sounds": {},
             "custom_sounds": [], "mute_windows_sounds": False, "saved_sounds": {},
-            "app_volumes": {}, "color_emoji": True, "known_apps": {}}
+            "app_volumes": {}, "color_emoji": True, "known_apps": {},
+            "mute_until": {}}  # aumid -> unix time the mute ends, 0 = until unmuted
 settings = {**DEFAULTS, **(app.load("settings", {}) or {})}
+for _a in settings.get("muted", []):
+    settings["mute_until"].setdefault(_a, 0)
+settings["muted"] = []
 DURATIONS = [4, 6, 10, 20]
 STYLES = ["solid", "glass", "tinted"]
 STYLE_NAMES = ["Solid", "Glass", "Tinted"]
@@ -107,6 +111,47 @@ def app_volume(aumid):
 def play(path, volume=None):
     if path:
         player.play(path, settings["volume"] if volume is None else volume)
+
+
+MUTE_OPTIONS = [("off", "Unmute"), ("15", "15 minutes"), ("60", "1 hour"), ("forever", "Until I unmute")]
+mute_menu_for = None  # the app whose mute options are open in the Sounds tab
+
+
+def is_muted(aumid):
+    until = settings["mute_until"].get(aumid)
+    return until is not None and (until == 0 or time.time() < until)
+
+
+def mute_text(aumid):
+    until = settings["mute_until"].get(aumid)
+    if until is None or not is_muted(aumid):
+        return ""
+    if until == 0:
+        return "Muted"
+    left = int((until - time.time() + 59) // 60)
+    return f"Muted \u00b7 {left} min left" if left < 60 else f"Muted \u00b7 {left // 60} h {left % 60} min left"
+
+
+def set_mute(aumid, mode):
+    """Muted apps still go into the history, but don't pop out or play a sound."""
+    if mode == "off":
+        settings["mute_until"].pop(aumid, None)
+    elif mode == "forever":
+        settings["mute_until"][aumid] = 0
+    else:
+        settings["mute_until"][aumid] = time.time() + int(mode) * 60
+    if aumid not in settings["known_apps"]:
+        settings["known_apps"][aumid] = wn.app_name(aumid, feed)
+    save_settings()
+
+
+def expire_mutes():
+    gone = [a for a, until in settings["mute_until"].items() if until and time.time() >= until]
+    for a in gone:
+        settings["mute_until"].pop(a)
+    if gone:
+        save_settings()
+    return bool(gone)
 
 
 def save_settings():
@@ -333,8 +378,8 @@ def reply_input(note):
 
 def bubble_buttons(note):
     """The toast's own buttons shown on hover (the reply box has its own send)."""
-    limit = 2 if reply_input(note) else 3
-    return [a for a in note["info"]["actions"] if a["content"] and not a["input"]][:limit]
+    # One of the app's own (e.g. Mark as Read); the bubble adds "Mute for" itself.
+    return [a for a in note["info"]["actions"] if a["content"] and not a["input"]][:1]
 
 
 def pop(note):
@@ -352,6 +397,7 @@ def pop(note):
         b64(note["image"] or note["icon"] or ""), str(others), str(settings["seconds"]), b64(ago(note["at"])),
         b64(hint), b64(labels) if labels else "",
         b64(note["icon"] if note["image"] and note["icon"] else ""),  # small app icon on the sender's photo
+        "1" if is_muted(note["aumid"]) else "0",
     ]))
 
 
@@ -561,18 +607,27 @@ def sound_settings():
     apps = dict(settings["known_apps"])
     for n in notes:
         apps.setdefault(n["aumid"], n["app"])
-    for aumid in list(settings["muted"]) + list(settings["app_sounds"]) + list(settings["app_volumes"]):
+    for aumid in list(settings["mute_until"]) + list(settings["app_sounds"]) + list(settings["app_volumes"]):
         apps.setdefault(aumid, wn.app_name(aumid, feed))
     if apps:
         parts.append(fenn.text("Apps", size="small", color="dim", bold=True))
         for aumid, name in sorted(apps.items(), key=lambda kv: kv[1].lower()):
+            muted = is_muted(aumid)
             parts.append(fenn.row([
-                fenn.toggle(f"app:{aumid}", aumid not in settings["muted"], label=name),
+                fenn.button(f"bell:{aumid}", icon="bell-slash" if muted else "bell",
+                            tooltip=(mute_text(aumid) + " \u00b7 click to change") if muted else "Mute this app"),
+                fenn.text(clip(name, 22), color="faint" if muted else "text"),
                 fenn.button(f"snd:{aumid}", label=sound_name(settings["app_sounds"].get(aumid, "default")),
                             icon="speaker-high", tooltip="Sound for this app: click for the next one"),
                 fenn.slider(f"vol:{aumid}", app_volume(aumid), min=0, max=100, step=5, width=90,
                             tooltip="Volume for this app"),
             ], gap=10))
+            if mute_menu_for == aumid:
+                options = [(k, label) for k, label in MUTE_OPTIONS if k != "off" or muted]
+                parts.append(fenn.row(
+                    ([fenn.text(mute_text(aumid), size="small", color="dim")] if muted else [])
+                    + [fenn.button(f"mute:{k}:{aumid}", label=label, primary=(k == "off")) for k, label in options],
+                    gap=6))
     else:
         parts.append(fenn.text("Apps show up here after their first notification.",
                                size="small", color="faint", wrap=True))
@@ -654,9 +709,10 @@ def poll():
         draw()  # the 10 s are up: the pill goes back to Fenn's own view
     fresh = []
     for raw in feed.poll():
-        if raw["aumid"] in settings["muted"]:
-            continue
         note = ingest(raw)
+        if note and is_muted(note["aumid"]):
+            note["unread"] = False  # no bubble, no sound, no marker
+            note["quiet"] = True
         if note:
             fresh.append(note)
     if fresh:
@@ -666,11 +722,12 @@ def poll():
         badge_until = time.monotonic() + BADGE_HOLD
         quiet = not settings["fullscreen"] and fullscreen_app_running()
         if not quiet:
-            loud = next((n for n in reversed(fresh) if sound_for(n)), None)
+            loud = next((n for n in reversed(fresh) if not n.get("quiet") and sound_for(n)), None)
             if loud:
                 play(sound_for(loud), app_volume(loud["aumid"]))
-        if settings["popup"] and (settings["fullscreen"] or not fullscreen_app_running()):
-            pop(fresh[-1])  # also pushes the badge timer past the bubble's own time
+        shown = [n for n in fresh if not n.get("quiet")]
+        if shown and settings["popup"] and (settings["fullscreen"] or not fullscreen_app_running()):
+            pop(shown[-1])  # also pushes the badge timer past the bubble's own time
         draw()
 
     # Photos that weren't there yet (Beeper downloads a new contact's avatar
@@ -687,6 +744,8 @@ def poll():
             draw()
 
     player.cleanup()
+    if expire_mutes():
+        draw()
 
     # Toasts dismissed in Windows (or retracted by the app) leave here too.
     if now - last_check > 3:
@@ -766,6 +825,12 @@ def on_bubble(msg):
                 run_action(n, act, {inp["id"]: text})
             else:
                 app.log(f"{n['app']}: no send action for the reply box", "warn")
+    elif kind == "mute":
+        oid, _, mode = arg.partition("|")
+        n = find(oid)
+        if n and mode in ("off", "15", "60", "forever"):
+            set_mute(n["aumid"], mode)
+            draw()
     elif kind == "hidden":
         badge_until = time.monotonic() + BADGE_HOLD  # count from when the bubble went back into the pill
         showing = None
@@ -949,6 +1014,7 @@ def hide_banner_for(aumid):
 
 @app.on_message("event")
 def on_event(e):
+    global mute_menu_for
     eid = e.get("id", "")
     if eid.startswith("n:"):
         n = find(eid[2:])
@@ -981,6 +1047,15 @@ def on_event(e):
         save_settings()
         play(sound_path(nxt) if nxt not in ("default", "none") else
              sound_path(settings["sound"]) if nxt == "default" else None, app_volume(aumid))
+        draw()
+    elif eid.startswith("bell:"):
+        aumid = eid[5:]
+        mute_menu_for = None if mute_menu_for == aumid else aumid
+        draw()
+    elif eid.startswith("mute:"):
+        mode, _, aumid = eid[5:].partition(":")
+        set_mute(aumid, mode)
+        mute_menu_for = None
         draw()
     elif eid.startswith("vol:"):
         aumid = eid[4:]

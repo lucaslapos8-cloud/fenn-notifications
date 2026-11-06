@@ -7,13 +7,13 @@
 # main.py drives it over stdin, one command per line:
 #   theme|dark|#RRGGBB
 #   config|<solid|glass|tinted>|<size 0..4>|<tint 0..3>
-#   show|id|b64 app|b64 title|b64 body|b64 image|more|seconds|b64 when|b64 reply hint|b64 labels (0x1F separated)|b64 app icon badge
+#   show|id|b64 app|b64 title|b64 body|b64 image|more|seconds|b64 when|b64 reply hint|b64 labels (0x1F separated)|b64 app icon badge|muted 0/1
 #   marker|<none|dot|count>|<unread>
 #   emoji|<0/1>|b64 cache folder
 #   layout|<left|center|right>|<primary|secondary|cursor>|<margin>|<pill|notch>|<autohide 0/1>
 #   hide
 # and it answers on stdout: ready, click|id, dismiss|id, hidden|id,
-# reply|id|b64 text, action|id|index
+# reply|id|b64 text, action|id|index, mute|id|<15|60|forever|off>
 
 $ErrorActionPreference = 'Stop'
 Add-Type -ReferencedAssemblies PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Drawing -TypeDefinition @'
@@ -193,6 +193,47 @@ public class Bubble : Window {
         AddRich(cText.Inlines, title, cText.FontSize, null, FontWeights.SemiBold);
         if (!string.IsNullOrEmpty(lastBody)) AddRich(cText.Inlines, "  " + lastBody.Replace("\n", " "), cText.FontSize, bodyText.Foreground, FontWeights.Normal);
         if (lastMore > 0) cText.Inlines.Add(new Run("  +" + lastMore) { Foreground = moreText.Foreground, FontWeight = FontWeights.SemiBold });
+    }
+
+    WrapPanel muteRow;
+    TextBlock muteLabel;
+
+    Border Pill(string label, Action click) {
+        var t = new TextBlock { Text = label, FontSize = 12, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center };
+        var b = new Border { CornerRadius = new CornerRadius(15), Height = 30, Padding = new Thickness(13, 0, 13, 0), Margin = new Thickness(6, 0, 0, 0),
+                             BorderThickness = new Thickness(1), Cursor = Cursors.Hand, Child = t };
+        StyleButton(b);
+        b.MouseEnter += (s, e) => b.Background = Overlay(0x3A);
+        b.MouseLeave += (s, e) => b.Background = Overlay(0x24);
+        b.MouseLeftButtonUp += (s, e) => { e.Handled = true; click(); };
+        return b;
+    }
+
+    void BuildMuteMenu(bool muted) {
+        muteRow.Children.Clear();
+        var options = new System.Collections.Generic.List<string[]>();
+        if (muted) options.Add(new[] { "off", "Unmute" });
+        options.Add(new[] { "15", "15 minutes" });
+        options.Add(new[] { "60", "1 hour" });
+        options.Add(new[] { "forever", "Until I unmute" });
+        foreach (var o in options) {
+            string mode = o[0];
+            var pill = Pill(o[1], () => {
+                Say("mute|" + current + "|" + mode);
+                muteLabel.Text = mode == "off" ? "Mute for" : "Muted";
+                BuildMuteMenu(mode != "off");
+                muteRow.Visibility = Visibility.Collapsed;
+                Relayout(HoverMs);
+                collapseAt = DateTime.Now.AddSeconds(1.2);
+            });
+            pill.Margin = new Thickness(6, 6, 0, 0);
+            muteRow.Children.Add(pill);
+        }
+    }
+
+    void ToggleMuteMenu() {
+        muteRow.Visibility = muteRow.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
+        Relayout(HoverMs);
     }
 
     public Marker marker;
@@ -403,6 +444,7 @@ public class Bubble : Window {
         content = new Grid { Width = Wide - 2, HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top, Opacity = 0 };
         content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        content.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         inner.Children.Add(content);
 
         mainArea = new Grid { Background = Brushes.Transparent, Cursor = Cursors.Hand };
@@ -487,6 +529,10 @@ public class Bubble : Window {
         actionsRow.Children.Add(sendBtn);
 
         buttons = new StackPanel { Orientation = Orientation.Horizontal };
+        // "Mute for" rolls this row down: 15 min / 1 hour / until unmuted (and Unmute).
+        muteRow = new WrapPanel { Margin = new Thickness(66, -6, 16, 14), Visibility = Visibility.Collapsed };
+        Grid.SetRow(muteRow, 2);
+        content.Children.Add(muteRow);
         Grid.SetColumn(buttons, 2);
         actionsRow.Children.Add(buttons);
 
@@ -713,6 +759,7 @@ public class Bubble : Window {
     bool FullLayout { get { return size != 0 || hoverOpen; } }
 
     Size Target() {
+        if (!hoverOpen && muteRow != null) muteRow.Visibility = Visibility.Collapsed;
         if (!FullLayout) return new Size(CompactW + 2 * EarW, PillH);
         double s = Scales[size];
         actionsRow.Visibility = hoverOpen && hasExtras ? Visibility.Visible : Visibility.Collapsed;
@@ -741,7 +788,7 @@ public class Bubble : Window {
 
     // ------------------------------------------------------------------ show / hide
 
-    public void Pop(string id, string app, string title, string body, string image, int more, double seconds, string when, string hint, string[] labels, string badge) {
+    public void Pop(string id, string app, string title, string body, string image, int more, double seconds, string when, string hint, string[] labels, string badge, bool muted) {
         current = id;
         appText.Text = app;
         whenText.Text = when;
@@ -772,7 +819,13 @@ public class Bubble : Window {
             b.MouseLeftButtonUp += (s, e) => { e.Handled = true; Say("action|" + current + "|" + index); Collapse(); };
             buttons.Children.Add(b);
         }
-        hasExtras = replyBox.Visibility == Visibility.Visible || buttons.Children.Count > 0;
+        // Our own button: mute this app for a while (replaces e.g. "Remind in 1 Hour").
+        var mutePill = Pill(muted ? "Muted" : "Mute for", ToggleMuteMenu);
+        muteLabel = (TextBlock)mutePill.Child;
+        buttons.Children.Add(mutePill);
+        BuildMuteMenu(muted);
+        muteRow.Visibility = Visibility.Collapsed;
+        hasExtras = true;
         collapseAt = DateTime.Now.AddSeconds(Math.Max(2, seconds));
 
         if (expanded && !collapsing) {
@@ -961,7 +1014,8 @@ public class Bubble : Window {
                     double secs; double.TryParse(f[7], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out secs);
                     string hint = f.Length > 9 ? D(f[9]) : "";
                     string[] labels = f.Length > 10 && f[10].Length > 0 ? D(f[10]).Split((char)0x1F) : new string[0];
-                    Pop(f[1], D(f[2]), D(f[3]), D(f[4]), D(f[5]), more, secs, D(f[8]), hint, labels, f.Length > 11 ? D(f[11]) : "");
+                    Pop(f[1], D(f[2]), D(f[3]), D(f[4]), D(f[5]), more, secs, D(f[8]), hint, labels, f.Length > 11 ? D(f[11]) : "",
+                        f.Length > 12 && f[12] == "1");
                 }
                 break;
             case "emoji":

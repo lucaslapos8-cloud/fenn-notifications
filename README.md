@@ -7,8 +7,9 @@ icon, the sender and the message. A few seconds later it shrinks back into the
 pill. Click it to open the chat or page it came from, the same as clicking the
 Windows notification.
 
-- **Hover** to keep it open and see the reply box and the app's own buttons
-  (for example *Mark as Read*). Type and press Enter to reply.
+- **Hover** to keep it open and see the reply box, the app's own button
+  (for example *Mark as Read*) and **Mute for**: 15 minutes, 1 hour or until
+  you unmute. Type and press Enter to reply.
 - **Right-click** or click **✕** to dismiss.
 - **Looks:** Tinted (smoked glass, default) with four tint strengths, Glass,
   or Solid.
@@ -24,7 +25,11 @@ Windows notification.
 - **History** like a messages list: one row per sender with their photo, the
   latest message, the time (now, 5m, Yesterday, ...) and an unread dot. Click
   the arrow on a row to see that sender's older messages; click any message to
-  open the chat. Per-app mute switches and all settings are below the list.
+  open the chat. The settings are below the list, in three tabs: Bubble,
+  Options and Sounds.
+- **Mute an app** from the bubble or with the bell next to it in the Sounds
+  tab (15 minutes, 1 hour, until you unmute). Muted apps still go into the
+  history, but don't pop out or play a sound.
 - **Sounds:** your own notification sound instead of Windows': pick one of
   Windows' built-in sounds or drop an MP3/WAV on the plugin's page, set the
   volume, and give apps their own sound (or none). Optionally mutes Windows'
