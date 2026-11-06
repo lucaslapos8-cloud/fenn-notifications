@@ -14,7 +14,9 @@ Windows notification.
   or Solid.
 - **Sizes:** XS (as small as Fenn's pill, one line), S, M, L, XL.
 - **Sender photos** with a small app icon on them, like on iPhone: taken from
-  the notification itself, or for Beeper from its local contact list.
+  the notification itself (Discord, Telegram, WhatsApp, Chrome/Edge web apps
+  and others that include one), or for Beeper from its local contact list and
+  chat pictures. Photos that appear later are filled into the history.
 - **Unread marker** between the time and the date in Fenn's clock pill: a
   small dot or a count, for 10 seconds after the bubble closes (or off, or
   until read). It hides while you hover the pill or when the pill shows

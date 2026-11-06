@@ -186,11 +186,26 @@ def click_arguments(note):
     return ""
 
 
-def local_image(src, cache_dir):
-    """A local file path for a toast image src, or None."""
+PACKAGE_FOLDERS = {"local": "LocalState", "roaming": "RoamingState", "temp": "TempState",
+                   "localcache": "LocalCache"}
+
+
+def local_image(src, cache_dir, aumid=None):
+    """A local file path for a toast image src, or None. Handles file paths,
+    web addresses (downloaded once) and ms-appdata:/// links, which packaged
+    apps (WhatsApp, Phone Link, ...) use for pictures in their own data folder."""
     if not src:
         return None
     try:
+        if src.lower().startswith("ms-appdata:///") and aumid and "!" in aumid:
+            rest = urllib.parse.unquote(src[len("ms-appdata:///"):])
+            folder, _, sub = rest.partition("/")
+            base = PACKAGE_FOLDERS.get(folder.lower())
+            if base:
+                path = os.path.join(os.path.expandvars(r"%LOCALAPPDATA%\Packages"), aumid.split("!")[0],
+                                    base, *[p for p in sub.split("/") if p and p != ".."])
+                return path if os.path.isfile(path) else None
+            return None
         if src.startswith("file:"):
             path = urllib.request.url2pathname(urllib.parse.urlparse(src).path)
             if re.match(r"^\\[A-Za-z]:", path):
@@ -295,6 +310,11 @@ def _beeper_photo(name, cache_dir):
             rows = conn.execute(
                 "select img_url from participants where img_url like 'mxc://%' and "
                 "(full_name = ? collate nocase or nickname = ? collate nocase)", (n, n)).fetchall()
+            # Group chats: the toast title is the chat's name, which has its own picture.
+            rows += conn.execute(
+                "select json_extract(thread, '$.imgURL') from threads where "
+                "json_extract(thread, '$.title') = ? collate nocase and "
+                "json_extract(thread, '$.imgURL') like 'mxc://%'", (n,)).fetchall()
             for (url,) in rows:
                 src = _mxc_path(url)
                 if src and os.path.isfile(src):
@@ -311,14 +331,14 @@ def _beeper_photo(name, cache_dir):
 def sender_photo(aumid, info, cache_dir):
     """The sender's picture: from the toast itself, or for Beeper from its
     local contact list (index.db, read-only) and avatar cache. None if unknown."""
-    path = local_image(info.get("image"), cache_dir)
+    path = local_image(info.get("image"), cache_dir, aumid)
     if path:
         return _cached_copy(path, cache_dir)
     if aumid.lower() not in BEEPER_AUMIDS or not info.get("title"):
         return None
     key = (aumid, info["title"].strip().lower())
     hit = _photo_cache.get(key)
-    if hit and (hit[0] or time.time() - hit[1] < 120):  # retry misses later: Beeper may cache the avatar meanwhile
+    if hit and (hit[0] or time.time() - hit[1] < 30):  # retry misses: Beeper downloads avatars when it shows them
         return hit[0]
     path = _beeper_photo(info["title"], cache_dir)
     _photo_cache[key] = (path, time.time())
@@ -700,15 +720,16 @@ def _packaged_activate(aumid, args):
         release(mgr)
 
 
-def activate(aumid, args="", activation="foreground", inputs=None, log=None):
-    """Runs on a worker thread so a slow app never stalls the plugin."""
+def activate(aumid, args="", activation="foreground", inputs=None, log=None, launch_only=False):
+    """Runs on a worker thread so a slow app never stalls the plugin.
+    launch_only: no notification to act on any more, just bring the app up."""
     def work():
         com_init()
         _allow_foreground()
         steps = []
         if activation == "protocol" and args:
             steps.append(("protocol", lambda: os.startfile(args)))
-        clsid = toast_activator(aumid)
+        clsid = None if launch_only else toast_activator(aumid)
         if clsid and activation != "protocol":
             steps.append(("activator " + clsid, lambda: _com_activate(clsid, aumid, args, inputs or {})))
         if "!" in aumid and activation != "protocol":

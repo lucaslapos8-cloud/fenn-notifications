@@ -45,6 +45,7 @@ notes = []          # newest first: {order, id, aumid, app, icon, image, info, a
 badge_until = 0.0   # monotonic time the pill's unread badge goes away ("10 s" mode)
 badge_shown = False
 marker_sent = None  # last marker line sent to the bubble process
+photo_check = 0.0   # when missing sender photos were last looked for
 showing = None      # the note in the bubble
 last_check = 0.0
 
@@ -521,7 +522,7 @@ def ingest(raw):
 
 
 def poll():
-    global last_check, badge_until
+    global last_check, badge_until, photo_check
     if badge_shown and settings.get("pill_badge", 1) == 1 and time.monotonic() >= badge_until:
         draw()  # the 10 s are up: the pill goes back to Fenn's own view
     fresh = []
@@ -540,8 +541,20 @@ def poll():
             pop(fresh[-1])  # also pushes the badge timer past the bubble's own time
         draw()
 
-    # Toasts dismissed in Windows (or retracted by the app) leave here too.
+    # Photos that weren't there yet (Beeper downloads a new contact's avatar
+    # once it shows the chat): look again now and then and fill them in.
     now = time.monotonic()
+    if settings["photos"] and now - photo_check > 30:
+        photo_check = now
+        found = False
+        for n in notes[:40]:
+            if not n["image"]:
+                n["image"] = wn.sender_photo(n["aumid"], n["info"], cache)
+                found = found or bool(n["image"])
+        if found:
+            draw()
+
+    # Toasts dismissed in Windows (or retracted by the app) leave here too.
     if now - last_check > 3:
         last_check = now
         gone = [n for n in notes if n["unread"] and not feed.still_present(n["id"])]
@@ -568,8 +581,21 @@ def run_action(n, action, inputs=None):
 
 
 def open_note(n):
+    """Does what clicking the Windows notification would do. Apps like Beeper
+    find the chat through the live notification (args carry its tag) and
+    remove their notifications once the chat is read, so an older message's
+    own args can be stale: then use the newest notification of the same
+    conversation that Windows still has, or just bring the app up."""
     n["unread"] = False
-    wn.activate(n["aumid"], wn.click_arguments(n), n["info"]["activation"], log=app.log)
+    args = wn.click_arguments(n)
+    target = n
+    if "tag=" in args and not feed.still_present(n["id"]):
+        key = conv_key(n)
+        target = next((x for x in notes if conv_key(x) == key and feed.still_present(x["id"])), None)
+    if target is not None:
+        wn.activate(target["aumid"], wn.click_arguments(target), target["info"]["activation"], log=app.log)
+    else:
+        wn.activate(n["aumid"], "", "foreground", log=app.log, launch_only=True)
     draw()
 
 
