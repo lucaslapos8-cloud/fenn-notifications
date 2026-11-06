@@ -9,6 +9,7 @@
 #   config|<solid|glass|tinted>|<size 0..4>|<tint 0..3>
 #   show|id|b64 app|b64 title|b64 body|b64 image|more|seconds|b64 when|b64 reply hint|b64 labels (0x1F separated)|b64 app icon badge
 #   marker|<none|dot|count>|<unread>
+#   layout|<left|center|right>|<primary|secondary|cursor>|<margin>|<pill|notch>|<autohide 0/1>
 #   hide
 # and it answers on stdout: ready, click|id, dismiss|id, hidden|id,
 # reply|id|b64 text, action|id|index
@@ -35,7 +36,7 @@ using System.Windows.Threading;
 namespace FennNotify {
 public class Bubble : Window {
     // Device-independent pixels. The pill matches Fenn's collapsed notch.
-    const double PillW = 140, PillH = 33, Wide = 400, CompactW = 340, Pad = 34;
+    const double PillW = FennLayout.PillW, PillH = FennLayout.PillH, Wide = 400, CompactW = 340, Pad = 34;
     // Size 0 is the compact, pill-high bubble; 1..4 scale the full bubble.
     static readonly double[] Scales = { 0.85, 0.85, 1.0, 1.15, 1.3 };
     const int GrowMs = 520, ShrinkMs = 380, HoverMs = 260;
@@ -125,8 +126,49 @@ public class Bubble : Window {
         try {
             var p = card.PointFromScreen(new Point(pt.X, pt.Y));
             if (p.X < 0 || p.Y < 0 || p.X > card.ActualWidth || p.Y > card.ActualHeight) return false;
-            return Math.Abs(p.X - card.ActualWidth / 2) <= FennHalfWidth && p.Y <= FennDepth;
+            // Fenn's pill (plus the room it grows into on hover), wherever Fenn put it.
+            double sc = FennLayout.Scale(), x = pt.X / sc, y = pt.Y / sc;
+            return x >= pill.Left - 30 && x <= pill.Right + 30 && y <= pill.Bottom + 28;
         } catch { return false; }
+    }
+
+    Rect pill = FennLayout.Pill();
+    readonly TranslateTransform slide = new TranslateTransform();
+
+    /// Puts the window where Fenn's pill is: the card grows out of the pill,
+    /// away from the screen edge when the notch sits in a corner.
+    void Place() {
+        pill = FennLayout.Pill();
+        string pl = FennLayout.Placement;
+        card.HorizontalAlignment = pl == "left" ? HorizontalAlignment.Left : pl == "right" ? HorizontalAlignment.Right : HorizontalAlignment.Center;
+        Left = pl == "left" ? pill.Left - Pad : pl == "right" ? pill.Right + Pad - Width : pill.Left + pill.Width / 2 - Width / 2;
+        Top = pill.Top;
+    }
+
+    double CardLeft() {
+        string pl = FennLayout.Placement;
+        return pl == "left" ? Pad : pl == "right" ? Width - Pad - card.ActualWidth : (Width - card.ActualWidth) / 2;
+    }
+
+    /// A rectangle with its own radius for the top and the bottom corners
+    /// (a notch hangs from the screen edge: square on top).
+    static Geometry RoundRect(double w, double h, double rt, double rb) {
+        rt = Math.Max(0, Math.Min(rt, Math.Min(w, h) / 2));
+        rb = Math.Max(0, Math.Min(rb, Math.Min(w, h) / 2));
+        var g = new StreamGeometry();
+        using (var c = g.Open()) {
+            c.BeginFigure(new Point(rt, 0), true, true);
+            c.LineTo(new Point(w - rt, 0), true, false);
+            if (rt > 0) c.ArcTo(new Point(w, rt), new Size(rt, rt), 0, false, SweepDirection.Clockwise, true, false);
+            c.LineTo(new Point(w, h - rb), true, false);
+            if (rb > 0) c.ArcTo(new Point(w - rb, h), new Size(rb, rb), 0, false, SweepDirection.Clockwise, true, false);
+            c.LineTo(new Point(rb, h), true, false);
+            if (rb > 0) c.ArcTo(new Point(0, h - rb), new Size(rb, rb), 0, false, SweepDirection.Clockwise, true, false);
+            c.LineTo(new Point(0, rt), true, false);
+            if (rt > 0) c.ArcTo(new Point(rt, 0), new Size(rt, rt), 0, false, SweepDirection.Clockwise, true, false);
+        }
+        g.Freeze();
+        return g;
     }
 
     public Bubble() {
@@ -152,6 +194,8 @@ public class Bubble : Window {
             Background = Brushes.Transparent,
             SnapsToDevicePixels = true,
             Effect = new DropShadowEffect { BlurRadius = 26, ShadowDepth = 5, Direction = 270, Opacity = 0.45, Color = Colors.Black },
+            Margin = new Thickness(Pad, 0, Pad, 0),
+            RenderTransform = slide,
         };
         root.Children.Add(card);
         Content = root;
@@ -418,16 +462,19 @@ public class Bubble : Window {
 
     void Reshape() {
         double r = Math.Min(card.ActualHeight / 2, 26);
-        card.CornerRadius = new CornerRadius(r);
-        double iw = Math.Max(0, card.ActualWidth - 2), ih = Math.Max(0, card.ActualHeight - 2);
-        inner.Clip = new RectangleGeometry(new Rect(0, 0, iw, ih), Math.Max(0, r - 1), Math.Max(0, r - 1));
+        bool notch = FennLayout.Notch;
+        // Fenn's "Notch" shape hangs from the top edge: square top corners, no top rim.
+        card.CornerRadius = notch ? new CornerRadius(0, 0, r, r) : new CornerRadius(r);
+        card.BorderThickness = notch ? new Thickness(1, 0, 1, 1) : new Thickness(1);
+        double iw = Math.Max(0, card.ActualWidth - 2), ih = Math.Max(0, card.ActualHeight - (notch ? 1 : 2));
+        inner.Clip = RoundRect(iw, ih, notch ? 0 : r - 1, r - 1);
         // Keep the blurred snapshot lined up with the real desktop behind the card.
         // The snapshot carries a border of repeated edge pixels (padX/padY) so
         // the heavy blur never pulls in transparency at the edges.
         backdrop.Width = Width + padX * 2;
         backdrop.Height = Height + padY * 2;
-        Canvas.SetLeft(backdrop, -((Width - card.ActualWidth) / 2) - 1 - padX);
-        Canvas.SetTop(backdrop, -1 - padY);
+        Canvas.SetLeft(backdrop, -CardLeft() - 1 - padX);
+        Canvas.SetTop(backdrop, -(FennLayout.Notch ? 0 : 1) - padY);
     }
 
     double padX, padY;
@@ -435,11 +482,11 @@ public class Bubble : Window {
     void CaptureBackdrop() {
         if (style == "solid") return;
         try {
-            double dpi;
-            using (var g = System.Drawing.Graphics.FromHwnd(IntPtr.Zero)) dpi = g.DpiX / 96.0;
-            int x = (int)Math.Round(Left * dpi), w = (int)Math.Round(Width * dpi), h = (int)Math.Round(Height * dpi);
+            double dpi = FennLayout.Scale();
+            int x = (int)Math.Round(Left * dpi), y = (int)Math.Round(Top * dpi);
+            int w = (int)Math.Round(Width * dpi), h = (int)Math.Round(Height * dpi);
             using (var full = new System.Drawing.Bitmap(w, h)) {
-                using (var g = System.Drawing.Graphics.FromImage(full)) g.CopyFromScreen(x, 0, 0, 0, new System.Drawing.Size(w, h));
+                using (var g = System.Drawing.Graphics.FromImage(full)) g.CopyFromScreen(x, y, 0, 0, new System.Drawing.Size(w, h));
                 // Shrinking the shot a lot is most of the blur; the BlurEffect smooths it out.
                 int k = style == "tinted" ? 28 : 18, pad = 6;
                 int sw = Math.Max(6, w / k), shh = Math.Max(4, h / k);
@@ -553,7 +600,7 @@ public class Bubble : Window {
         expanded = true;
         hoverOpen = false;
         typing = false;
-        Left = SystemParameters.PrimaryScreenWidth / 2 - Width / 2;
+        Place();
         CaptureBackdrop();
         card.BeginAnimation(WidthProperty, null);
         card.BeginAnimation(HeightProperty, null);
@@ -567,8 +614,19 @@ public class Bubble : Window {
         KeepOnTop();
         HookMouse(true);
         var t = Target();
-        Grow(card, t.Width, t.Height, GrowMs, new BackEase { Amplitude = size == 0 ? 0.2 : 0.32, EasingMode = EasingMode.EaseOut });
-        Fade(FullLayout ? (UIElement)content : compact, 1, 260, 170);
+        if (FennLayout.AutoHide) {
+            // Fenn's notch is tucked away, so there's no pill to grow out of:
+            // slide the whole bubble down from the top edge, like Fenn does.
+            card.Width = t.Width; card.Height = t.Height;
+            (FullLayout ? (UIElement)content : compact).Opacity = 1;
+            slide.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(-(t.Height + 40), 0, TimeSpan.FromMilliseconds(GrowMs)) {
+                EasingFunction = new BackEase { Amplitude = 0.25, EasingMode = EasingMode.EaseOut } });
+        } else {
+            slide.BeginAnimation(TranslateTransform.YProperty, null);
+            slide.Y = 0;
+            Grow(card, t.Width, t.Height, GrowMs, new BackEase { Amplitude = size == 0 ? 0.2 : 0.32, EasingMode = EasingMode.EaseOut });
+            Fade(FullLayout ? (UIElement)content : compact, 1, 260, 170);
+        }
     }
 
     static ImageBrush LoadBrush(string path, int px) {
@@ -618,6 +676,22 @@ public class Bubble : Window {
         collapsing = true;
         typing = false;
         NoActivate(true);
+        Fade(closeBtn, 0, 100);
+        if (FennLayout.AutoHide) {
+            var up = new DoubleAnimation(-(card.ActualHeight + 40), TimeSpan.FromMilliseconds(ShrinkMs)) {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn } };
+            up.Completed += (s, e) => {
+                if (!collapsing) return;
+                collapsing = false; expanded = false; hoverOpen = false;
+                HookMouse(false);
+                Hide();
+                slide.BeginAnimation(TranslateTransform.YProperty, null);
+                slide.Y = 0;
+                Say("hidden|" + current);
+            };
+            slide.BeginAnimation(TranslateTransform.YProperty, up);
+            return;
+        }
         Fade(content, 0, 140);
         Fade(compact, 0, 140);
         Fade(closeBtn, 0, 100);
@@ -690,6 +764,21 @@ public class Bubble : Window {
                     Pop(f[1], D(f[2]), D(f[3]), D(f[4]), D(f[5]), more, secs, D(f[8]), hint, labels, f.Length > 11 ? D(f[11]) : "");
                 }
                 break;
+            case "layout":
+                // layout|<left|center|right>|<primary|secondary|cursor>|<margin>|<pill|notch>|<autohide 0/1>
+                if (f.Length >= 6) {
+                    FennLayout.Placement = f[1] == "left" || f[1] == "right" ? f[1] : "center";
+                    FennLayout.MonitorMode = f[2] == "secondary" || f[2] == "cursor" ? f[2] : "primary";
+                    double mg;
+                    if (double.TryParse(f[3], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out mg))
+                        FennLayout.Margin = Math.Max(0, Math.Min(64, mg));
+                    FennLayout.Notch = f[4] == "notch";
+                    FennLayout.AutoHide = f[5] == "1";
+                    if (marker != null) marker.Relayout();
+                    if (!IsOut) Place();
+                    Reshape();
+                }
+                break;
             case "marker":
                 if (marker != null && f.Length >= 3) {
                     int count; int.TryParse(f[2], out count);
@@ -726,11 +815,78 @@ public class Bubble : Window {
     }
 }
 
+// Where Fenn's notch is, from Fenn's own settings (sent by main.py from
+// config.toml). Fenn spans its window across the top of the chosen monitor's
+// work area and rests a 140 x 34 pill in it: left, centre or right, `margin`
+// away from the edges. A "notch" shape hangs from the top edge instead.
+public static class FennLayout {
+    public static string Placement = "center", MonitorMode = "primary";
+    public static double Margin = 0;
+    public static bool Notch = false, AutoHide = false;
+    public const double PillW = 140, PillH = 34;
+
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
+    [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int Size; public RECT Monitor, Work; public uint Flags; }
+    delegate bool MonitorProc(IntPtr mon, IntPtr hdc, IntPtr rect, IntPtr data);
+    [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorProc proc, IntPtr data);
+    [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr mon, ref MONITORINFO info);
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(POINT p, uint flags);
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
+
+    /// Screen pixels per DIP in this process's coordinate space.
+    public static double Scale() {
+        double px = GetSystemMetrics(0); // SM_CXSCREEN
+        return px > 0 ? px / SystemParameters.PrimaryScreenWidth : 1.0;
+    }
+
+    static MONITORINFO Info(IntPtr mon) {
+        var mi = new MONITORINFO { Size = Marshal.SizeOf(typeof(MONITORINFO)) };
+        GetMonitorInfo(mon, ref mi);
+        return mi;
+    }
+
+    /// The work area of the monitor Fenn uses, in DIPs.
+    public static Rect Work() {
+        MONITORINFO pick = new MONITORINFO();
+        bool found = false;
+        if (MonitorMode == "cursor") {
+            POINT p; GetCursorPos(out p);
+            pick = Info(MonitorFromPoint(p, 2)); // nearest
+            found = true;
+        } else {
+            MONITORINFO primary = new MONITORINFO(), other = new MONITORINFO();
+            bool hasPrimary = false, hasOther = false;
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (m, h, r, d) => {
+                var mi = Info(m);
+                if ((mi.Flags & 1) != 0) { primary = mi; hasPrimary = true; }
+                else if (!hasOther) { other = mi; hasOther = true; }
+                return true;
+            }, IntPtr.Zero);
+            if (MonitorMode == "secondary" && hasOther) { pick = other; found = true; }
+            else if (hasPrimary) { pick = primary; found = true; }
+        }
+        double s = Scale();
+        if (!found) return new Rect(0, 0, SystemParameters.PrimaryScreenWidth, SystemParameters.PrimaryScreenHeight);
+        return new Rect(pick.Work.L / s, pick.Work.T / s, (pick.Work.R - pick.Work.L) / s, (pick.Work.B - pick.Work.T) / s);
+    }
+
+    /// Fenn's collapsed pill, in DIPs (screen coordinates).
+    public static Rect Pill() {
+        var work = Work();
+        double frac = Placement == "left" ? 0 : Placement == "right" ? 1 : 0.5;
+        double lo = work.Left + Margin, hi = Math.Max(lo, work.Right - Margin - PillW);
+        double x = lo + (hi - lo) * frac;
+        double y = work.Top + (Notch ? 0 : Margin);
+        return new Rect(x, y, PillW, PillH);
+    }
+}
+
 // The unread marker: a small dot or count drawn in the gap between the time
 // and the date of Fenn's collapsed clock pill. Click-through, never focused.
+// It finds the gap on screen, so it follows the pill wherever Fenn puts it.
 public class Marker : Window {
-    // Where Fenn draws its clock, relative to the screen centre, in DIPs.
-    const double GapCenter = 8.8, PillMid = 16.4, TimeEnd = -8, DateStart = 25.6;
     readonly Bubble bubble;
     readonly Grid holder;
     readonly Ellipse dot;
@@ -739,7 +895,8 @@ public class Marker : Window {
     readonly ScaleTransform pop = new ScaleTransform(1, 1);
     readonly DispatcherTimer tick;
     string style = "none";
-    bool dark = true, clockShowing = true, shown;
+    bool dark = true, shown;
+    double? gapX;          // centre of the time/date gap in DIPs, when the clock shows
     int n, checkIn;
     IntPtr hwnd;
 
@@ -753,11 +910,9 @@ public class Marker : Window {
         bubble = owner;
         WindowStyle = WindowStyle.None; AllowsTransparency = true; Background = Brushes.Transparent;
         Topmost = true; ShowInTaskbar = false; ShowActivated = false; ResizeMode = ResizeMode.NoResize;
-        Width = 30; Height = 33; Top = 0;
-        Left = SystemParameters.PrimaryScreenWidth / 2 + GapCenter - Width / 2;
+        Width = 30; Height = 30; Top = 0; Left = 0;
         Opacity = 0;
-        holder = new Grid { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Top,
-                            Margin = new Thickness(0, PillMid - 8, 0, 0), Height = 16,
+        holder = new Grid { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Height = 16,
                             RenderTransformOrigin = new Point(0.5, 0.5), RenderTransform = pop };
         dot = new Ellipse { Width = 7, Height = 7, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
         countText = new TextBlock { FontSize = 9.5, FontWeight = FontWeights.Bold, Foreground = Brushes.White,
@@ -782,7 +937,7 @@ public class Marker : Window {
             // Fenn re-raises its own full-width window now and then; stay above it.
             if (shown && hwnd != IntPtr.Zero && ticks % 4 == 0) SetWindowPos(hwnd, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
             if (Environment.GetEnvironmentVariable("FENN_MARKER_DEBUG") == "1" && ticks % 7 == 0)
-                Bubble.Say("debug|marker shown=" + shown + " style=" + style + " n=" + n + " clock=" + clockShowing + " out=" + bubble.IsOut + " scale=" + Scale());
+                Bubble.Say("debug|marker shown=" + shown + " style=" + style + " n=" + n + " gap=" + gapX + " pill=" + FennLayout.Pill());
         };
         tick.Start();
     }
@@ -803,58 +958,74 @@ public class Marker : Window {
         Update();
     }
 
+    /// Fenn's settings changed: look for the pill again right away.
+    public void Relayout() { checkIn = 0; }
+
     bool Wanted() {
-        if (style == "none" || n <= 0 || bubble.IsOut) return false;
+        // Tucked-away notch: there is no pill to put it on.
+        if (style == "none" || n <= 0 || bubble.IsOut || FennLayout.AutoHide) return false;
+        double scale = FennLayout.Scale();
+        var pill = FennLayout.Pill();
         POINT p; GetCursorPos(out p);
-        double scale = Scale();
-        double cx = SystemParameters.PrimaryScreenWidth / 2 * scale;
-        if (Math.Abs(p.X - cx) < 190 * scale && p.Y < 70 * scale) return false; // Fenn grows under the cursor
-        if (--checkIn <= 0) { checkIn = 5; clockShowing = ClockShowing(scale); }
-        return clockShowing;
+        double cx = p.X / scale, cy = p.Y / scale;
+        // Fenn grows under the cursor.
+        if (cx > pill.Left - 50 && cx < pill.Right + 50 && cy < pill.Bottom + 36) return false;
+        if (--checkIn <= 0) { checkIn = 5; gapX = FindGap(pill, scale); }
+        return gapX.HasValue;
     }
 
-    [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
-
-    // Screen pixels per DIP in the coordinate space GetCursorPos and screen
-    // captures use for this process (works whatever DPI mode it runs in).
-    double Scale() {
-        double px = GetSystemMetrics(0); // SM_CXSCREEN
-        return px > 0 ? px / SystemParameters.PrimaryScreenWidth : 1.0;
+    bool IsText(System.Drawing.Color c) {
+        int hi = Math.Max(c.R, Math.Max(c.G, c.B)), lo = Math.Min(c.R, Math.Min(c.G, c.B));
+        return dark ? (lo > 140 && hi - lo < 50) : (hi < 95 && hi - lo < 50);
     }
 
-    // True when the pill shows Fenn's clock: text left and right of the gap,
-    // nothing at the gap's edges. Music in the pill or an open notch fails this.
-    bool ClockShowing(double scale) {
+    // The centre of the empty gap between the time and the date, in DIPs, or
+    // null when the pill isn't showing its clock (music, open notch, ...).
+    double? FindGap(Rect pill, double scale) {
         try {
-            int cx = (int)Math.Round(SystemParameters.PrimaryScreenWidth / 2 * scale);
-            int x0 = cx - (int)(90 * scale), w = (int)(180 * scale), y0 = (int)(6 * scale), h = (int)(22 * scale);
+            int x0 = (int)Math.Round((pill.Left + 6) * scale), w = (int)Math.Round((pill.Width - 12) * scale);
+            int y0 = (int)Math.Round((pill.Top + 7) * scale), h = (int)Math.Round((pill.Height - 14) * scale);
+            if (w < 10 || h < 4) return null;
+            var cols = new bool[w];
+            // Our own marker sits in the gap: don't mistake it for text.
+            int skipA = int.MaxValue, skipB = int.MinValue;
+            if (shown) { skipA = (int)((Left - 2) * scale) - x0; skipB = (int)((Left + Width + 2) * scale) - x0; }
             using (var bmp = new System.Drawing.Bitmap(w, h)) {
                 using (var g = System.Drawing.Graphics.FromImage(bmp)) g.CopyFromScreen(x0, y0, 0, 0, new System.Drawing.Size(w, h));
-                Func<double, double, bool> anyText = (from, to) => {
-                    int a = Math.Max(0, cx - x0 + (int)(from * scale)), b = Math.Min(w - 1, cx - x0 + (int)(to * scale));
-                    for (int x = a; x <= b; x++)
-                        for (int y = 0; y < h; y++) {
-                            var c = bmp.GetPixel(x, y);
-                            if (dark ? (c.R > 150 && c.G > 150 && c.B > 150) : (c.R < 90 && c.G < 90 && c.B < 90)) return true;
-                        }
-                    return false;
-                };
-                bool l = anyText(-60, TimeEnd - 1), r = anyText(DateStart + 1, 60);
-                // Leave a few pixels of slack next to the text: wider times like "11:23 PM" reach close to the gap.
-                bool gl = anyText(TimeEnd + 5, GapCenter - 9), gr = anyText(GapCenter + 9, DateStart - 4);
-                if (Environment.GetEnvironmentVariable("FENN_MARKER_DEBUG") == "1")
-                    Bubble.Say("debug|clock l=" + l + " r=" + r + " gl=" + gl + " gr=" + gr + " cx=" + cx + " x0=" + x0 + " w=" + w);
-                return l && r && !gl && !gr;
+                for (int x = 0; x < w; x++) {
+                    if (x >= skipA && x <= skipB) continue;
+                    for (int y = 0; y < h; y++) if (IsText(bmp.GetPixel(x, y))) { cols[x] = true; break; }
+                }
             }
-        } catch { return true; }
+            // Runs of text columns; letters and words closer than 7 DIP belong together.
+            var runs = new System.Collections.Generic.List<int[]>();
+            int join = (int)(7 * scale);
+            for (int x = 0; x < w; x++) {
+                if (!cols[x]) continue;
+                if (runs.Count > 0 && x - runs[runs.Count - 1][1] <= join) runs[runs.Count - 1][1] = x;
+                else runs.Add(new[] { x, x });
+            }
+            if (runs.Count < 2) return null;
+            int best = -1, bestW = 0;
+            for (int i = 0; i + 1 < runs.Count; i++) {
+                int gw = runs[i + 1][0] - runs[i][1];
+                if (gw > bestW) { bestW = gw; best = i; }
+            }
+            if (bestW < 16 * scale) return null;
+            return (x0 + (runs[best][1] + runs[best + 1][0]) / 2.0) / scale;
+        } catch { return null; }
     }
 
     void Update() {
         bool want = Wanted();
+        if (want && gapX.HasValue) {
+            var pill = FennLayout.Pill();
+            Left = gapX.Value - Width / 2;
+            Top = pill.Top + pill.Height / 2 - Height / 2;
+        }
         if (want == shown) return;
         shown = want;
         if (want) {
-            Left = SystemParameters.PrimaryScreenWidth / 2 + GapCenter - Width / 2;
             if (!IsVisible) Show();
             if (hwnd != IntPtr.Zero) SetWindowPos(hwnd, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
             BeginAnimation(OpacityProperty, new DoubleAnimation(1, TimeSpan.FromMilliseconds(220)));

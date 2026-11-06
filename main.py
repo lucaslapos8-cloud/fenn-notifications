@@ -125,6 +125,8 @@ class Bubble:
         self.mtime = self._script_mtime()
         self._send_now(f"theme|{'dark' if app.dark else 'light'}|{app.accent}")
         self._send_now(config_line())
+        if layout_sent:
+            self._send_now(layout_sent)  # where Fenn's notch is
         if marker_sent:
             self._send_now(marker_sent)  # a restarted bubble process gets the marker back
 
@@ -176,6 +178,74 @@ def config_line():
     style = settings["style"] if settings["style"] in STYLES else "solid"
     return (f"config|{style}|{min(4, max(0, int(settings['size'])))}"
             f"|{min(3, max(0, int(settings.get('tint', 0))))}")
+
+
+# ---------------------------------------------------------------------------
+# Following Fenn's own notch settings (position, monitor, margin, shape,
+# auto-hide), so the bubble and the unread marker sit on the real pill.
+
+FENN_CONFIG = os.path.join(os.environ.get("APPDATA", ""), "Fenn", "config.toml")
+fenn_config_mtime = None
+layout_sent = None
+
+
+def read_fenn_config():
+    """Top-level keys of Fenn's config.toml (a tiny parser: Python 3.8 has no
+    tomllib, and only plain `key = value` lines before the first table matter)."""
+    out = {}
+    try:
+        with open(FENN_CONFIG, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    break
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                value = value.split(" #")[0].strip()
+                if value[:1] in "\"'":
+                    value = value[1:-1]
+                elif value in ("true", "false"):
+                    value = value == "true"
+                else:
+                    try:
+                        value = float(value)
+                    except ValueError:
+                        pass
+                out[key.strip()] = value
+    except OSError:
+        pass
+    return out
+
+
+def layout_line():
+    cfg = read_fenn_config()
+    placement = str(cfg.get("placement", "center")).lower()
+    monitor = str(cfg.get("monitor", "primary")).lower().replace("_", "").replace("-", "")
+    monitor = "cursor" if "cursor" in monitor or "follow" in monitor else monitor
+    try:
+        margin = max(0.0, min(64.0, float(cfg.get("margin", 0))))
+    except (TypeError, ValueError):
+        margin = 0.0
+    shape = "notch" if str(cfg.get("shape", "pill")).lower() == "notch" else "pill"
+    hide = 1 if cfg.get("auto_hide") is True else 0
+    return f"layout|{placement}|{monitor}|{margin:g}|{shape}|{hide}"
+
+
+def check_fenn_config(force=False):
+    """Sends the layout when Fenn's settings change (or on start)."""
+    global fenn_config_mtime, layout_sent
+    try:
+        mtime = os.path.getmtime(FENN_CONFIG)
+    except OSError:
+        mtime = None
+    if not force and mtime == fenn_config_mtime:
+        return
+    fenn_config_mtime = mtime
+    line = layout_line()
+    if force or line != layout_sent:
+        layout_sent = line
+        bubble.send(line)
 
 
 def b64(s):
@@ -714,6 +784,8 @@ threading.Thread(target=wn._shortcut_activators, daemon=True).start()  # warm th
 threading.Thread(target=lambda: bubble.send("hide"), daemon=True).start()  # start the window early
 
 app.every(0.35, poll)
+app.every(1.0, check_fenn_config)  # Fenn's settings: follow moves, margin and shape changes
+check_fenn_config(force=True)
 app.every(30, draw)  # keeps "2m ago" labels fresh
 poll()  # sets the starting point; old toasts are not replayed
 draw()

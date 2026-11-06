@@ -97,8 +97,10 @@ reach the island either. Turn them back on (banners can stay off).
   Clicking then opens the app, but may not jump to the exact chat.
 - Glass looks show a snapshot from when the bubble opened: video playing
   behind it doesn't move in the blur.
-- The bubble's position assumes Fenn's pill is centered at the top of the
-  primary monitor (Fenn's default).
+- The bubble and the unread marker follow Fenn's own settings (position,
+  monitor, margin, pill or notch shape, auto-hide) by reading Fenn's
+  `config.toml` once a second. On mixed-DPI multi-monitor setups the position
+  on a secondary monitor can be a few pixels off.
 
 ## License
 
@@ -106,6 +108,13 @@ MIT, see [LICENSE](LICENSE). `fenn.py` is Fenn's plugin helper (MIT, © The
 Nook contributors).
 
 ## Changelog
+
+**1.2.1**
+- Follows Fenn's notch settings live: left/center/right, primary/secondary/
+  follow-cursor monitor, margin, pill or notch shape.
+- With Fenn's auto-hide on, the bubble slides down from the top edge and the
+  unread marker stays hidden.
+- The unread marker finds the gap between the time and the date on screen.
 
 **1.2.0**
 - Fixed: notifications stopped popping up after Windows cleared old ones.
