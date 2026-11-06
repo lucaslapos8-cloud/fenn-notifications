@@ -112,8 +112,10 @@ Nook contributors).
 **1.2.1**
 - Follows Fenn's notch settings live: left/center/right, primary/secondary/
   follow-cursor monitor, margin, pill or notch shape.
-- With Fenn's auto-hide on, the bubble slides down from the top edge and the
-  unread marker stays hidden.
+- Notch shape: the bubble hangs from the top edge with curved corners that
+  flare into it, like Fenn's open notch.
+- With Fenn's auto-hide on, the bubble flies down from the top edge while
+  growing, closes the same way in reverse, and the unread marker stays hidden.
 - The unread marker finds the gap between the time and the date on screen.
 
 **1.2.0**
