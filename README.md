@@ -129,6 +129,12 @@ graphics (CC-BY 4.0, © Twitter, Inc. and other contributors), downloaded at run
 
 ## Changelog
 
+**1.3.1**
+- Mute an app for 15 minutes, 1 hour or until you unmute: from the bubble's
+  new "Mute for" button (it replaces the app's second button) or the bell
+  next to each app in the Sounds tab, which also shows the time left.
+  Muted apps still go into the history but stay silent.
+
 **1.3.0**
 - Notification sounds: Windows' built-in sounds or your own MP3/WAV (drop it
   on the page), a volume, and a sound and volume for each app (or none).
