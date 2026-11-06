@@ -124,6 +124,16 @@ graphics (CC-BY 4.0, © Twitter, Inc. and other contributors), downloaded at run
 
 ## Changelog
 
+**1.3.0**
+- Notification sounds: Windows' built-in sounds or your own MP3/WAV (drop it
+  on the page), a volume, and a sound and volume for each app (or none).
+  Optionally mutes Windows' own notification sounds; alarms and calls keep
+  ringing.
+- Color emoji in the bubble (Twemoji pictures, downloaded once each).
+- Settings in three tabs: Bubble, Options and Sounds.
+- Apps stay in the list after the history is cleared, so their sound and
+  volume can be set anytime.
+
 **1.2.2**
 - Fixed: older messages in the history didn't open their chat in apps that
   remove their notifications once a chat is read (like Beeper).
