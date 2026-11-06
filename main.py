@@ -19,6 +19,14 @@ import time
 import fenn
 import winnotif as wn
 
+# Fenn's protocol is UTF-8 JSON lines. Fenn sets PYTHONIOENCODING for plugins,
+# but don't rely on it: emoji in a message would otherwise break the output.
+for _stream in (sys.stdout, sys.stdin):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 app = fenn.Plugin()
@@ -31,7 +39,8 @@ DEFAULTS = {"popup": True, "seconds": 6, "hide_banners": False,
             "style": "tinted", "size": 2, "tint": 0,
             "photos": True, "pill_badge": 1, "marker": 1,
             "sound_on": False, "sound": "b:message", "volume": 70, "app_sounds": {},
-            "custom_sounds": [], "mute_windows_sounds": False, "saved_sounds": {}}
+            "custom_sounds": [], "mute_windows_sounds": False, "saved_sounds": {},
+            "app_volumes": {}}
 settings = {**DEFAULTS, **(app.load("settings", {}) or {})}
 DURATIONS = [4, 6, 10, 20]
 STYLES = ["solid", "glass", "tinted"]
@@ -90,9 +99,14 @@ def sound_for(note):
     return sound_path(key) or sound_path("b:message")
 
 
-def play(path):
+def app_volume(aumid):
+    """An app's own volume, or the main one until it gets its own."""
+    return settings["app_volumes"].get(aumid, settings["volume"])
+
+
+def play(path, volume=None):
     if path:
-        player.play(path, settings["volume"])
+        player.play(path, settings["volume"] if volume is None else volume)
 
 
 def save_settings():
@@ -543,6 +557,8 @@ def page_view():
                 fenn.toggle(f"app:{aumid}", aumid not in settings["muted"], label=name),
                 fenn.button(f"snd:{aumid}", label=sound_name(settings["app_sounds"].get(aumid, "default")),
                             icon="speaker-high", tooltip="Sound for this app: click for the next one"),
+                fenn.slider(f"vol:{aumid}", app_volume(aumid), min=0, max=100, step=5, width=90,
+                            tooltip="Volume for this app"),
             ], gap=10))
     return fenn.column(parts, gap=8, scroll=True)
 
@@ -607,7 +623,9 @@ def poll():
         badge_until = time.monotonic() + BADGE_HOLD
         quiet = not settings["fullscreen"] and fullscreen_app_running()
         if not quiet:
-            play(next((p for p in (sound_for(n) for n in reversed(fresh)) if p), None))
+            loud = next((n for n in reversed(fresh) if sound_for(n)), None)
+            if loud:
+                play(sound_for(loud), app_volume(loud["aumid"]))
         if settings["popup"] and (settings["fullscreen"] or not fullscreen_app_running()):
             pop(fresh[-1])  # also pushes the badge timer past the bubble's own time
         draw()
@@ -904,8 +922,16 @@ def on_event(e):
             settings["app_sounds"][aumid] = nxt
         save_settings()
         play(sound_path(nxt) if nxt not in ("default", "none") else
-             sound_path(settings["sound"]) if nxt == "default" else None)
+             sound_path(settings["sound"]) if nxt == "default" else None, app_volume(aumid))
         draw()
+    elif eid.startswith("vol:"):
+        aumid = eid[4:]
+        settings["app_volumes"][aumid] = int(e.get("value") or 0)
+        if e.get("kind") == "commit":
+            save_settings()
+            key = settings["app_sounds"].get(aumid, "default")
+            if key != "none":
+                play(sound_path(settings["sound"] if key == "default" else key), app_volume(aumid))
     elif eid.startswith("app:"):
         aumid = eid[4:]
         muted = settings["muted"]
