@@ -40,7 +40,7 @@ DEFAULTS = {"popup": True, "seconds": 6, "hide_banners": False,
             "photos": True, "pill_badge": 1, "marker": 1,
             "sound_on": False, "sound": "b:message", "volume": 70, "app_sounds": {},
             "custom_sounds": [], "mute_windows_sounds": False, "saved_sounds": {},
-            "app_volumes": {}, "color_emoji": True}
+            "app_volumes": {}, "color_emoji": True, "known_apps": {}}
 settings = {**DEFAULTS, **(app.load("settings", {}) or {})}
 DURATIONS = [4, 6, 10, 20]
 STYLES = ["solid", "glass", "tinted"]
@@ -480,21 +480,13 @@ def header_row(latest, group, last, many, open_):
     ], gap=10)
 
 
-def page_view():
-    parts = []
-    if notes:
-        convs = conversations()[:30]
-        for i, (latest, group) in enumerate(convs):
-            parts.append(conversation_row(latest, group, i == len(convs) - 1))
-    else:
-        parts.append(fenn.column([
-            fenn.icon("bell", size=28, color="faint"),
-            fenn.text("No notifications", bold=True),
-            fenn.text("You're all caught up.", color="faint"),
-        ], gap=4, align="center"))
+TAB_NAMES = ["Bubble", "Options", "Sounds"]
+settings_tab = 0  # which settings tab the page shows
 
-    parts += [
-        fenn.divider(),
+
+def bubble_settings():
+    """How the bubble pops out, looks and leaves a marker in the pill."""
+    parts = [
         fenn.toggle("popup", settings["popup"], label="Pop out of the island when one arrives"),
         fenn.row([
             fenn.text("Collapse after", color="dim"),
@@ -524,17 +516,29 @@ def page_view():
             fenn.text("Show it", color="dim"),
             fenn.chips("pill_badge", BADGE_NAMES, min(2, max(0, int(settings.get("pill_badge", 1))))),
         ], gap=8),
+    ]
+    return parts
+
+
+def option_settings():
+    return [
         fenn.toggle("photos", settings["photos"], label="Sender photos (Beeper: from its local contact list)"),
         fenn.toggle("color_emoji", settings["color_emoji"],
                     label="Color emoji in the bubble (Twemoji pictures, downloaded once each)"),
         fenn.toggle("fullscreen", settings["fullscreen"], label="Also pop out over full-screen apps and games"),
         fenn.toggle("hide_banners", settings["hide_banners"],
                     label="Hide Windows banners (show them only here)"),
-        fenn.text("Turns off “Show notification banners” for each app in Windows; they still go to "
+        fenn.text("Turns off \u201cShow notification banners\u201d for each app in Windows; they still go to "
                   "the notification center. Switching this off puts the banners back. If an app keeps "
                   "showing banners, sign out and in once, or turn on Do not disturb.",
                   size="small", color="faint", wrap=True),
-        fenn.divider(),
+    ]
+
+
+def sound_settings():
+    """The sound, its volume, Windows' own sounds, and every app's switch,
+    sound and volume (apps stay listed after the history is cleared)."""
+    parts = [
         fenn.toggle("sound_on", settings["sound_on"], label="Play a sound with each notification"),
         fenn.row([
             fenn.text("Sound", color="dim"),
@@ -554,8 +558,10 @@ def page_view():
                   "keep ringing. Switching this off puts the old sounds back.",
                   size="small", color="faint", wrap=True),
     ]
-    apps = {n["aumid"]: n["app"] for n in notes}
-    for aumid in settings["muted"]:
+    apps = dict(settings["known_apps"])
+    for n in notes:
+        apps.setdefault(n["aumid"], n["app"])
+    for aumid in list(settings["muted"]) + list(settings["app_sounds"]) + list(settings["app_volumes"]):
         apps.setdefault(aumid, wn.app_name(aumid, feed))
     if apps:
         parts.append(fenn.text("Apps", size="small", color="dim", bold=True))
@@ -567,6 +573,33 @@ def page_view():
                 fenn.slider(f"vol:{aumid}", app_volume(aumid), min=0, max=100, step=5, width=90,
                             tooltip="Volume for this app"),
             ], gap=10))
+    else:
+        parts.append(fenn.text("Apps show up here after their first notification.",
+                               size="small", color="faint", wrap=True))
+    return parts
+
+
+def page_view():
+    parts = []
+    if notes:
+        convs = conversations()[:30]
+        for i, (latest, group) in enumerate(convs):
+            parts.append(conversation_row(latest, group, i == len(convs) - 1))
+    else:
+        parts.append(fenn.column([
+            fenn.icon("bell", size=28, color="faint"),
+            fenn.text("No notifications", bold=True),
+            fenn.text("You're all caught up.", color="faint"),
+        ], gap=4, align="center"))
+
+    parts.append(fenn.divider())
+    parts.append(fenn.chips("tab", TAB_NAMES, settings_tab))
+    if settings_tab == 0:
+        parts += bubble_settings()
+    elif settings_tab == 1:
+        parts += option_settings()
+    else:
+        parts += sound_settings()
     return fenn.column(parts, gap=8, scroll=True)
 
 
@@ -603,6 +636,9 @@ def ingest(raw):
         at = time.time()
     if settings["hide_banners"]:
         hide_banner_for(aumid)
+    if aumid not in settings["known_apps"]:  # keep its settings row even after the history is cleared
+        settings["known_apps"][aumid] = wn.app_name(aumid, feed)
+        save_settings()
     return {
         "order": raw["order"], "id": raw["id"], "aumid": aumid, "tag": raw["tag"],
         "app": wn.app_name(aumid, feed),
@@ -868,6 +904,13 @@ def on_color_emoji(e):
     draw()
 
 
+@app.on("tab")
+def on_tab(e):
+    global settings_tab
+    settings_tab = e["value"]["index"]
+    draw()
+
+
 @app.on("fullscreen")
 def on_fullscreen(e):
     settings["fullscreen"] = bool(e.get("value"))
@@ -1003,6 +1046,21 @@ threading.Thread(target=lambda: bubble.send("hide"), daemon=True).start()  # sta
 app.every(0.35, poll)
 app.every(1.0, check_fenn_config)  # Fenn's settings: follow moves, margin and shape changes
 check_fenn_config(force=True)
+
+
+def seed_known_apps():
+    """List the apps that already have notifications in Windows, so their
+    sound and volume can be set before the next one arrives."""
+    added = False
+    for aumid in feed.apps_with_toasts():
+        if aumid not in settings["known_apps"] and aumid not in settings["muted"]:
+            settings["known_apps"][aumid] = wn.app_name(aumid, feed)
+            added = True
+    if added:
+        save_settings()
+
+
+seed_known_apps()
 app.every(30, draw)  # keeps "2m ago" labels fresh
 poll()  # sets the starting point; old toasts are not replayed
 draw()

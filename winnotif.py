@@ -93,6 +93,15 @@ class NotificationFeed:
             self.seen = {k for k in self.seen if (k[1] or 0) >= cutoff or (k[0] or 0) >= self.max_id - 50}
         return out
 
+    def apps_with_toasts(self):
+        """AppUserModelIDs that have notifications in the notification center now."""
+        try:
+            return [r[0] for r in self._connect().execute(
+                "select distinct h.PrimaryId from Notification n join NotificationHandler h "
+                "on h.RecordId = n.HandlerId where n.Type = 'toast'")]
+        except sqlite3.Error:
+            return []
+
     def still_present(self, nid):
         """False once the toast was dismissed in Windows (or by the app)."""
         try:
