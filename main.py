@@ -29,7 +29,9 @@ os.makedirs(cache, exist_ok=True)
 DEFAULTS = {"popup": True, "seconds": 6, "hide_banners": False,
             "muted": [], "banner_changed": [], "fullscreen": False,
             "style": "tinted", "size": 2, "tint": 0,
-            "photos": True, "pill_badge": 1, "marker": 1}
+            "photos": True, "pill_badge": 1, "marker": 1,
+            "sound_on": False, "sound": "b:message", "volume": 70, "app_sounds": {},
+            "custom_sounds": [], "mute_windows_sounds": False, "saved_sounds": {}}
 settings = {**DEFAULTS, **(app.load("settings", {}) or {})}
 DURATIONS = [4, 6, 10, 20]
 STYLES = ["solid", "glass", "tinted"]
@@ -48,6 +50,49 @@ marker_sent = None  # last marker line sent to the bubble process
 photo_check = 0.0   # when missing sender photos were last looked for
 showing = None      # the note in the bubble
 last_check = 0.0
+
+
+player = wn.SoundPlayer()
+SOUNDS_DIR = os.path.join(app.data_dir, "sounds")
+
+
+def sound_library():
+    """[(key, name, path)]: Windows' built-in sounds, then the user's own files."""
+    out = [("b:" + i, name, os.path.join(wn.MEDIA, f)) for i, name, f in wn.BUILTIN_SOUNDS
+           if os.path.isfile(os.path.join(wn.MEDIA, f))]
+    for c in settings["custom_sounds"]:
+        if os.path.isfile(c["path"]):
+            out.append(("f:" + c["path"], c["name"], c["path"]))
+    return out
+
+
+def sound_name(key):
+    if key == "default":
+        return "Default"
+    if key == "none":
+        return "No sound"
+    return next((n for k, n, _ in sound_library() if k == key), "Message")
+
+
+def sound_path(key):
+    return next((path for k, _, path in sound_library() if k == key), None)
+
+
+def sound_for(note):
+    """The file to play for a notification, or None for silence."""
+    if not settings["sound_on"] or note["info"].get("silent"):
+        return None
+    key = settings["app_sounds"].get(note["aumid"], "default")
+    if key == "none":
+        return None
+    if key == "default":
+        key = settings["sound"]
+    return sound_path(key) or sound_path("b:message")
+
+
+def play(path):
+    if path:
+        player.play(path, settings["volume"])
 
 
 def save_settings():
@@ -468,6 +513,25 @@ def page_view():
                   "the notification center. Switching this off puts the banners back. If an app keeps "
                   "showing banners, sign out and in once, or turn on Do not disturb.",
                   size="small", color="faint", wrap=True),
+        fenn.divider(),
+        fenn.toggle("sound_on", settings["sound_on"], label="Play a sound with each notification"),
+        fenn.row([
+            fenn.text("Sound", color="dim"),
+            fenn.button("sound_next", label=sound_name(settings["sound"]), icon="music-note",
+                        tooltip="Click for the next sound"),
+            fenn.button("sound_test", icon="play", tooltip="Play it"),
+        ], gap=8),
+        fenn.row([
+            fenn.text("Volume", color="dim"),
+            fenn.slider("volume", settings["volume"], min=0, max=100, step=5),
+        ], gap=8),
+        fenn.text("Drop an MP3 or WAV file on this page to add your own sound.",
+                  size="small", color="faint", wrap=True),
+        fenn.toggle("mute_windows_sounds", settings["mute_windows_sounds"],
+                    label="Mute Windows\u2019 own notification sounds"),
+        fenn.text("Sets the Notification sounds in Control Panel \u203a Sound to (None); alarms and calls "
+                  "keep ringing. Switching this off puts the old sounds back.",
+                  size="small", color="faint", wrap=True),
     ]
     apps = {n["aumid"]: n["app"] for n in notes}
     for aumid in settings["muted"]:
@@ -475,7 +539,11 @@ def page_view():
     if apps:
         parts.append(fenn.text("Apps", size="small", color="dim", bold=True))
         for aumid, name in sorted(apps.items(), key=lambda kv: kv[1].lower()):
-            parts.append(fenn.toggle(f"app:{aumid}", aumid not in settings["muted"], label=name))
+            parts.append(fenn.row([
+                fenn.toggle(f"app:{aumid}", aumid not in settings["muted"], label=name),
+                fenn.button(f"snd:{aumid}", label=sound_name(settings["app_sounds"].get(aumid, "default")),
+                            icon="speaker-high", tooltip="Sound for this app: click for the next one"),
+            ], gap=10))
     return fenn.column(parts, gap=8, scroll=True)
 
 
@@ -537,6 +605,9 @@ def poll():
             notes.insert(0, n)
         del notes[60:]
         badge_until = time.monotonic() + BADGE_HOLD
+        quiet = not settings["fullscreen"] and fullscreen_app_running()
+        if not quiet:
+            play(next((p for p in (sound_for(n) for n in reversed(fresh)) if p), None))
         if settings["popup"] and (settings["fullscreen"] or not fullscreen_app_running()):
             pop(fresh[-1])  # also pushes the badge timer past the bubble's own time
         draw()
@@ -553,6 +624,8 @@ def poll():
                 found = found or bool(n["image"])
         if found:
             draw()
+
+    player.cleanup()
 
     # Toasts dismissed in Windows (or retracted by the app) leave here too.
     if now - last_check > 3:
@@ -699,6 +772,69 @@ def on_photos(e):
     draw()
 
 
+@app.on("sound_on")
+def on_sound_on(e):
+    settings["sound_on"] = bool(e.get("value"))
+    save_settings()
+    if settings["sound_on"]:
+        play(sound_path(settings["sound"]))
+    draw()
+
+
+@app.on("sound_next")
+def on_sound_next(e):
+    keys = [k for k, _, _ in sound_library()]
+    i = keys.index(settings["sound"]) if settings["sound"] in keys else -1
+    settings["sound"] = keys[(i + 1) % len(keys)]
+    save_settings()
+    play(sound_path(settings["sound"]))
+    draw()
+
+
+@app.on("sound_test")
+def on_sound_test(e):
+    play(sound_path(settings["sound"]))
+
+
+@app.on("volume")
+def on_volume(e):
+    settings["volume"] = int(e.get("value") or 0)
+    if e.get("kind") == "commit":
+        save_settings()
+        play(sound_path(settings["sound"]))
+
+
+@app.on("mute_windows_sounds")
+def on_mute_windows_sounds(e):
+    settings["mute_windows_sounds"] = bool(e.get("value"))
+    settings["saved_sounds"] = wn.mute_windows_sounds(settings["mute_windows_sounds"], settings["saved_sounds"])
+    save_settings()
+    draw()
+
+
+@app.on_message("files")
+def on_files(msg):
+    """Dropped sound files become choices; the last one is the new default."""
+    import shutil
+    added = None
+    for path in msg.get("paths", []):
+        if not path.lower().endswith(wn.SOUND_FILE_TYPES) or not os.path.isfile(path):
+            continue
+        os.makedirs(SOUNDS_DIR, exist_ok=True)
+        dst = os.path.join(SOUNDS_DIR, os.path.basename(path))
+        if os.path.abspath(path) != os.path.abspath(dst):
+            shutil.copyfile(path, dst)
+        name = os.path.splitext(os.path.basename(path))[0][:24]
+        settings["custom_sounds"] = [c for c in settings["custom_sounds"] if c["path"] != dst]
+        settings["custom_sounds"].append({"name": name, "path": dst})
+        added = "f:" + dst
+    if added:
+        settings["sound"] = added
+        save_settings()
+        play(sound_path(added))
+        draw()
+
+
 @app.on("fullscreen")
 def on_fullscreen(e):
     settings["fullscreen"] = bool(e.get("value"))
@@ -756,6 +892,20 @@ def on_event(e):
                         m["unread"] = False
             open_note(n)
             app.close_page()
+    elif eid.startswith("snd:"):
+        # Per-app sound: Default -> No sound -> each sound in the library -> Default ...
+        aumid = eid[4:]
+        keys = ["default", "none"] + [k for k, _, _ in sound_library()]
+        cur = settings["app_sounds"].get(aumid, "default")
+        nxt = keys[(keys.index(cur) + 1) % len(keys)] if cur in keys else "none"
+        if nxt == "default":
+            settings["app_sounds"].pop(aumid, None)
+        else:
+            settings["app_sounds"][aumid] = nxt
+        save_settings()
+        play(sound_path(nxt) if nxt not in ("default", "none") else
+             sound_path(settings["sound"]) if nxt == "default" else None)
+        draw()
     elif eid.startswith("app:"):
         aumid = eid[4:]
         muted = settings["muted"]

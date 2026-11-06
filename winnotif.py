@@ -793,3 +793,96 @@ def set_banner(aumid, show):
 
 def filetime_to_unix(ft):
     return ft / 10_000_000 - 11_644_473_600 if ft else time.time()
+
+
+# ---------------------------------------------------------------------------
+# Sounds: playing our own, and muting Windows' notification sounds
+
+MEDIA = os.path.expandvars(r"%WINDIR%\Media")
+BUILTIN_SOUNDS = [  # (id, name, file in C:\Windows\Media)
+    ("notify", "Notify", "Windows Notify System Generic.wav"),
+    ("message", "Message", "Windows Notify Messaging.wav"),
+    ("email", "Email", "Windows Notify Email.wav"),
+    ("calendar", "Calendar", "Windows Notify Calendar.wav"),
+    ("nudge", "Nudge", "Windows Message Nudge.wav"),
+    ("ding", "Ding", "Windows Ding.wav"),
+    ("chimes", "Chimes", "chimes.wav"),
+    ("tada", "Tada", "tada.wav"),
+]
+SOUND_FILE_TYPES = (".wav", ".mp3", ".wma", ".m4a", ".aac", ".flac")
+
+winmm = ctypes.WinDLL("winmm")
+winmm.mciSendStringW.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.UINT, wt.HANDLE]
+winmm.mciSendStringW.restype = wt.DWORD
+
+
+class SoundPlayer:
+    """Plays WAV/MP3/... through Windows' MCI (no extra installs), at a
+    volume. Each sound gets its own alias, closed once it has had time to end."""
+
+    def __init__(self):
+        self.n = 0
+        self.open = []  # (alias, monotonic time opened)
+
+    @staticmethod
+    def _mci(cmd):
+        buf = ctypes.create_unicode_buffer(256)
+        err = winmm.mciSendStringW(cmd, buf, 256, None)
+        return err, buf.value
+
+    def play(self, path, volume=70):
+        self.cleanup(force=True)
+        if not path or not os.path.isfile(path):
+            return False
+        self.n += 1
+        alias = f"fennsnd{self.n}"
+        # mpegvideo (DirectShow) plays WAV and MP3 alike and supports a volume.
+        err, _ = self._mci(f'open "{path}" type mpegvideo alias {alias}')
+        if err:
+            return False
+        self._mci(f"setaudio {alias} volume to {max(0, min(1000, int(volume * 10)))}")
+        err, _ = self._mci(f"play {alias}")
+        self.open.append((alias, time.monotonic()))
+        return not err
+
+    def cleanup(self, force=False):
+        keep = []
+        for alias, at in self.open:
+            if force or time.monotonic() - at > 30:
+                self._mci(f"close {alias}")
+            else:
+                keep.append((alias, at))
+        self.open = keep
+
+
+SOUND_EVENTS_KEY = r"AppEvents\Schemes\Apps\.Default"
+# Toast sounds. Alarms and calls (Notification.Looping.*) keep ringing.
+WINDOWS_SOUND_EVENTS = ["Notification.Default", "Notification.IM", "Notification.Mail",
+                        "Notification.Reminder", "Notification.SMS", "Notification.Proximity"]
+
+
+def mute_windows_sounds(mute, saved):
+    """Off: sets Windows' notification sound events to "(None)", the same as
+    Control Panel > Sound, and returns what they were. On: puts them back from
+    `saved`. Applies right away."""
+    out = dict(saved or {})
+    for event in WINDOWS_SOUND_EVENTS:
+        path = rf"{SOUND_EVENTS_KEY}\{event}\.Current"
+        try:
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0,
+                                    winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE) as k:
+                try:
+                    current, kind = winreg.QueryValueEx(k, "")
+                except OSError:
+                    current, kind = None, winreg.REG_SZ
+                if mute:
+                    if event not in out and current:  # remember the real sound (and its type) once
+                        out[event] = [current, kind]
+                    winreg.SetValueEx(k, "", 0, kind, "")
+                elif event in out:
+                    value = out.pop(event)
+                    value, kind = (value if isinstance(value, list) else [value, kind])
+                    winreg.SetValueEx(k, "", 0, kind, value)
+        except OSError:
+            pass
+    return out

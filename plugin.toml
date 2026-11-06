@@ -6,6 +6,7 @@ name = "Notifications"
 icon = "bell"
 size = "wide"
 run = ["python", "main.py"]
+accepts_files = true
 page_size = [460, 260]
 description = "Windows notifications pop out of the island instead of the screen corner. Click one to open the chat it came from."
 author = "Lujlap"

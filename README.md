@@ -25,6 +25,10 @@ Windows notification.
   latest message, the time (now, 5m, Yesterday, ...) and an unread dot. Click
   the arrow on a row to see that sender's older messages; click any message to
   open the chat. Per-app mute switches and all settings are below the list.
+- **Sounds:** your own notification sound instead of Windows': pick one of
+  Windows' built-in sounds or drop an MP3/WAV on the plugin's page, set the
+  volume, and give apps their own sound (or none). Optionally mutes Windows'
+  own notification sounds (alarms and calls keep ringing).
 - Skips full-screen games, videos and presentations unless you turn that on.
 - Notifications you dismiss in Windows disappear here too.
 
@@ -89,6 +93,10 @@ reach the island either. Turn them back on (banners can stay off).
   (`%APPDATA%\BeeperTexts\index.db`, read-only, contacts table only) and copies
   their already-downloaded avatar into its cache. Nothing leaves your PC.
   Switch off **Sender photos** to skip this.
+- With **Mute Windows' own notification sounds** on, the plugin sets the
+  Notification sound events under `HKCU\AppEvents\Schemes\Apps\.Default` to
+  "(None)" (like Control Panel > Sound) and restores the previous sounds when
+  you switch it off. Sound files you drop are copied into the data folder.
 - With **Hide Windows banners** on, the plugin writes `ShowBanner` values under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings`, and
   removes them again when you switch it off.
