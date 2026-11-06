@@ -733,28 +733,27 @@ public class Bubble : Window {
         NoActivate(true);
         Fade(closeBtn, 0, 100);
         if (FennLayout.AutoHide) {
-            Fade(content, 0, 140);
-            Fade(compact, 0, 140);
-            var shrink = new CubicEase { EasingMode = EasingMode.EaseInOut };
-            var sw = new DoubleAnimation(PillW + 2 * EarW, TimeSpan.FromMilliseconds(ShrinkMs)) { EasingFunction = shrink, BeginTime = TimeSpan.FromMilliseconds(60) };
-            var sh = new DoubleAnimation(PillH, TimeSpan.FromMilliseconds(ShrinkMs)) { EasingFunction = shrink, BeginTime = TimeSpan.FromMilliseconds(60) };
-            sh.Completed += (s, e) => {
+            // The fly-in played backwards: the content fades, the bubble shrinks
+            // back to a notch (the same bounce, reversed) and, overlapping the
+            // end of that, flies up out of sight. Same timings as coming in.
+            Fade(content, 0, 260);
+            Fade(compact, 0, 260);
+            var back = new BackEase { Amplitude = size == 0 ? 0.2 : 0.32, EasingMode = EasingMode.EaseIn };
+            card.BeginAnimation(WidthProperty, new DoubleAnimation(PillW + 2 * EarW, TimeSpan.FromMilliseconds(GrowMs)) { EasingFunction = back });
+            card.BeginAnimation(HeightProperty, new DoubleAnimation(PillH, TimeSpan.FromMilliseconds(GrowMs)) { EasingFunction = back });
+            var up = new DoubleAnimation(-(PillH + 36), TimeSpan.FromMilliseconds(300)) {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn },
+                BeginTime = TimeSpan.FromMilliseconds(GrowMs + 110 - 300) };
+            up.Completed += (s2, e2) => {
                 if (!collapsing) return;
-                var up = new DoubleAnimation(-(PillH + 36), TimeSpan.FromMilliseconds(220)) {
-                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn } };
-                up.Completed += (s2, e2) => {
-                    if (!collapsing) return;
-                    collapsing = false; expanded = false; hoverOpen = false;
-                    HookMouse(false);
-                    Hide();
-                    slide.BeginAnimation(TranslateTransform.YProperty, null);
-                    slide.Y = 0;
-                    Say("hidden|" + current);
-                };
-                slide.BeginAnimation(TranslateTransform.YProperty, up);
+                collapsing = false; expanded = false; hoverOpen = false;
+                HookMouse(false);
+                Hide();
+                slide.BeginAnimation(TranslateTransform.YProperty, null);
+                slide.Y = 0;
+                Say("hidden|" + current);
             };
-            card.BeginAnimation(WidthProperty, sw);
-            card.BeginAnimation(HeightProperty, sh);
+            slide.BeginAnimation(TranslateTransform.YProperty, up);
             return;
         }
         Fade(content, 0, 140);
