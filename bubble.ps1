@@ -135,13 +135,52 @@ public class Bubble : Window {
     Rect pill = FennLayout.Pill();
     readonly TranslateTransform slide = new TranslateTransform();
 
+    // In notch shape the top corners flare out into the screen edge with small
+    // concave curves ("ears"), like Fenn's open notch. EarW is their width.
+    const double Ear = 11;
+    static double EarW { get { return FennLayout.Notch ? Ear : 0; } }
+    readonly System.Windows.Shapes.Path rimPath = new System.Windows.Shapes.Path {
+        StrokeThickness = 2, IsHitTestVisible = false, Visibility = Visibility.Collapsed };
+
+    /// Outline of the notch: hangs from the top edge, ears at the top, rounded bottom.
+    static Geometry NotchGeometry(double w, double h, double e, double rb, bool closed) {
+        rb = Math.Max(0, Math.Min(rb, Math.Min((w - 2 * e) / 2, h - e)));
+        var g = new StreamGeometry();
+        using (var c = g.Open()) {
+            if (closed) {
+                c.BeginFigure(new Point(0, 0), true, true);
+                c.LineTo(new Point(w, 0), true, false);
+                c.ArcTo(new Point(w - e, e), new Size(e, e), 0, false, SweepDirection.Counterclockwise, true, false);
+                c.LineTo(new Point(w - e, h - rb), true, false);
+                c.ArcTo(new Point(w - e - rb, h), new Size(rb, rb), 0, false, SweepDirection.Clockwise, true, false);
+                c.LineTo(new Point(e + rb, h), true, false);
+                c.ArcTo(new Point(e, h - rb), new Size(rb, rb), 0, false, SweepDirection.Clockwise, true, false);
+                c.LineTo(new Point(e, e), true, false);
+                c.ArcTo(new Point(0, 0), new Size(e, e), 0, false, SweepDirection.Counterclockwise, true, false);
+            } else {
+                // The rim: the same outline without the top edge (it meets the screen edge).
+                c.BeginFigure(new Point(0, 0), false, false);
+                c.ArcTo(new Point(e, e), new Size(e, e), 0, false, SweepDirection.Clockwise, true, false);
+                c.LineTo(new Point(e, h - rb), true, false);
+                c.ArcTo(new Point(e + rb, h), new Size(rb, rb), 0, false, SweepDirection.Counterclockwise, true, false);
+                c.LineTo(new Point(w - e - rb, h), true, false);
+                c.ArcTo(new Point(w - e, h - rb), new Size(rb, rb), 0, false, SweepDirection.Counterclockwise, true, false);
+                c.LineTo(new Point(w - e, e), true, false);
+                c.ArcTo(new Point(w, 0), new Size(e, e), 0, false, SweepDirection.Clockwise, true, false);
+            }
+        }
+        g.Freeze();
+        return g;
+    }
+
     /// Puts the window where Fenn's pill is: the card grows out of the pill,
     /// away from the screen edge when the notch sits in a corner.
     void Place() {
         pill = FennLayout.Pill();
         string pl = FennLayout.Placement;
         card.HorizontalAlignment = pl == "left" ? HorizontalAlignment.Left : pl == "right" ? HorizontalAlignment.Right : HorizontalAlignment.Center;
-        Left = pl == "left" ? pill.Left - Pad : pl == "right" ? pill.Right + Pad - Width : pill.Left + pill.Width / 2 - Width / 2;
+        Left = pl == "left" ? pill.Left - Pad - EarW : pl == "right" ? pill.Right + Pad + EarW - Width : pill.Left + pill.Width / 2 - Width / 2;
+        content.Margin = compact.Margin = new Thickness(EarW, 0, 0, 0);
         Top = pill.Top;
     }
 
@@ -332,6 +371,7 @@ public class Bubble : Window {
         compact.Children.Add(cText);
         compact.MouseLeftButtonUp += (s, e) => Open();
         inner.Children.Add(compact);
+        inner.Children.Add(rimPath);
 
         ApplyTheme();
 
@@ -463,17 +503,30 @@ public class Bubble : Window {
     void Reshape() {
         double r = Math.Min(card.ActualHeight / 2, 26);
         bool notch = FennLayout.Notch;
-        // Fenn's "Notch" shape hangs from the top edge: square top corners, no top rim.
-        card.CornerRadius = notch ? new CornerRadius(0, 0, r, r) : new CornerRadius(r);
-        card.BorderThickness = notch ? new Thickness(1, 0, 1, 1) : new Thickness(1);
-        double iw = Math.Max(0, card.ActualWidth - 2), ih = Math.Max(0, card.ActualHeight - (notch ? 1 : 2));
-        inner.Clip = RoundRect(iw, ih, notch ? 0 : r - 1, r - 1);
+        if (notch) {
+            // Fenn's "Notch" shape hangs from the top edge, flaring into it with
+            // ears; the card draws its own outline and rim instead of a border.
+            double w = card.ActualWidth, h = card.ActualHeight;
+            card.CornerRadius = new CornerRadius(0);
+            card.BorderThickness = new Thickness(0);
+            double rb = Math.Min((h - Ear) / 2 + 4, 26);
+            inner.Clip = NotchGeometry(w, h, Ear, rb, true);
+            rimPath.Data = NotchGeometry(w, h, Ear, rb, false);
+            rimPath.Stroke = card.BorderBrush;
+            rimPath.Visibility = Visibility.Visible;
+        } else {
+            card.CornerRadius = new CornerRadius(r);
+            card.BorderThickness = new Thickness(1);
+            rimPath.Visibility = Visibility.Collapsed;
+            double iw = Math.Max(0, card.ActualWidth - 2), ih = Math.Max(0, card.ActualHeight - 2);
+            inner.Clip = RoundRect(iw, ih, r - 1, r - 1);
+        }
         // Keep the blurred snapshot lined up with the real desktop behind the card.
         // The snapshot carries a border of repeated edge pixels (padX/padY) so
         // the heavy blur never pulls in transparency at the edges.
         backdrop.Width = Width + padX * 2;
         backdrop.Height = Height + padY * 2;
-        Canvas.SetLeft(backdrop, -CardLeft() - 1 - padX);
+        Canvas.SetLeft(backdrop, -CardLeft() - (FennLayout.Notch ? 0 : 1) - padX);
         Canvas.SetTop(backdrop, -(FennLayout.Notch ? 0 : 1) - padY);
     }
 
@@ -519,12 +572,12 @@ public class Bubble : Window {
     bool FullLayout { get { return size != 0 || hoverOpen; } }
 
     Size Target() {
-        if (!FullLayout) return new Size(CompactW, PillH);
+        if (!FullLayout) return new Size(CompactW + 2 * EarW, PillH);
         double s = Scales[size];
         actionsRow.Visibility = hoverOpen && hasExtras ? Visibility.Visible : Visibility.Collapsed;
         content.LayoutTransform = new ScaleTransform(s, s);
         content.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-        return new Size(Math.Round(Wide * s), Math.Ceiling(content.DesiredSize.Height) + 2);
+        return new Size(Math.Round(Wide * s) + 2 * EarW, Math.Ceiling(content.DesiredSize.Height) + 2);
     }
 
     void ShowLayout() {
@@ -604,7 +657,7 @@ public class Bubble : Window {
         CaptureBackdrop();
         card.BeginAnimation(WidthProperty, null);
         card.BeginAnimation(HeightProperty, null);
-        card.Width = PillW; card.Height = PillH;
+        card.Width = PillW + 2 * EarW; card.Height = PillH;
         ShowLayout();
         content.BeginAnimation(OpacityProperty, null); content.Opacity = 0;
         compact.BeginAnimation(OpacityProperty, null); compact.Opacity = 0;
@@ -615,12 +668,14 @@ public class Bubble : Window {
         HookMouse(true);
         var t = Target();
         if (FennLayout.AutoHide) {
-            // Fenn's notch is tucked away, so there's no pill to grow out of:
-            // slide the whole bubble down from the top edge, like Fenn does.
-            card.Width = t.Width; card.Height = t.Height;
-            (FullLayout ? (UIElement)content : compact).Opacity = 1;
-            slide.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(-(t.Height + 40), 0, TimeSpan.FromMilliseconds(GrowMs)) {
-                EasingFunction = new BackEase { Amplitude = 0.25, EasingMode = EasingMode.EaseOut } });
+            // Fenn's notch is tucked away: a pill flies down from the top edge
+            // and grows into the bubble on the way, like the notch coming out.
+            slide.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation(-(PillH + 36), 0, TimeSpan.FromMilliseconds(300)) {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } });
+            var ease = new BackEase { Amplitude = size == 0 ? 0.2 : 0.32, EasingMode = EasingMode.EaseOut };
+            card.BeginAnimation(WidthProperty, new DoubleAnimation(t.Width, TimeSpan.FromMilliseconds(GrowMs)) { EasingFunction = ease, BeginTime = TimeSpan.FromMilliseconds(110) });
+            card.BeginAnimation(HeightProperty, new DoubleAnimation(t.Height, TimeSpan.FromMilliseconds(GrowMs)) { EasingFunction = ease, BeginTime = TimeSpan.FromMilliseconds(110) });
+            Fade(FullLayout ? (UIElement)content : compact, 1, 260, 260);
         } else {
             slide.BeginAnimation(TranslateTransform.YProperty, null);
             slide.Y = 0;
@@ -678,25 +733,35 @@ public class Bubble : Window {
         NoActivate(true);
         Fade(closeBtn, 0, 100);
         if (FennLayout.AutoHide) {
-            var up = new DoubleAnimation(-(card.ActualHeight + 40), TimeSpan.FromMilliseconds(ShrinkMs)) {
-                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn } };
-            up.Completed += (s, e) => {
+            Fade(content, 0, 140);
+            Fade(compact, 0, 140);
+            var shrink = new CubicEase { EasingMode = EasingMode.EaseInOut };
+            var sw = new DoubleAnimation(PillW + 2 * EarW, TimeSpan.FromMilliseconds(ShrinkMs)) { EasingFunction = shrink, BeginTime = TimeSpan.FromMilliseconds(60) };
+            var sh = new DoubleAnimation(PillH, TimeSpan.FromMilliseconds(ShrinkMs)) { EasingFunction = shrink, BeginTime = TimeSpan.FromMilliseconds(60) };
+            sh.Completed += (s, e) => {
                 if (!collapsing) return;
-                collapsing = false; expanded = false; hoverOpen = false;
-                HookMouse(false);
-                Hide();
-                slide.BeginAnimation(TranslateTransform.YProperty, null);
-                slide.Y = 0;
-                Say("hidden|" + current);
+                var up = new DoubleAnimation(-(PillH + 36), TimeSpan.FromMilliseconds(220)) {
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn } };
+                up.Completed += (s2, e2) => {
+                    if (!collapsing) return;
+                    collapsing = false; expanded = false; hoverOpen = false;
+                    HookMouse(false);
+                    Hide();
+                    slide.BeginAnimation(TranslateTransform.YProperty, null);
+                    slide.Y = 0;
+                    Say("hidden|" + current);
+                };
+                slide.BeginAnimation(TranslateTransform.YProperty, up);
             };
-            slide.BeginAnimation(TranslateTransform.YProperty, up);
+            card.BeginAnimation(WidthProperty, sw);
+            card.BeginAnimation(HeightProperty, sh);
             return;
         }
         Fade(content, 0, 140);
         Fade(compact, 0, 140);
         Fade(closeBtn, 0, 100);
         var ease = new CubicEase { EasingMode = EasingMode.EaseInOut };
-        var w = new DoubleAnimation(PillW, TimeSpan.FromMilliseconds(ShrinkMs)) { EasingFunction = ease, BeginTime = TimeSpan.FromMilliseconds(60) };
+        var w = new DoubleAnimation(PillW + 2 * EarW, TimeSpan.FromMilliseconds(ShrinkMs)) { EasingFunction = ease, BeginTime = TimeSpan.FromMilliseconds(60) };
         var h = new DoubleAnimation(PillH, TimeSpan.FromMilliseconds(ShrinkMs)) { EasingFunction = ease, BeginTime = TimeSpan.FromMilliseconds(60) };
         h.Completed += (s, e) => {
             if (!collapsing) return;
