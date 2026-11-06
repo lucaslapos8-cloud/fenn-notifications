@@ -111,6 +111,14 @@ Nook contributors).
 
 ## Changelog
 
+**1.2.2**
+- Fixed: older messages in the history didn't open their chat in apps that
+  remove their notifications once a chat is read (like Beeper).
+- Sender photos from packaged apps (WhatsApp, Phone Link, ...) that store
+  them in their own data folder.
+- Beeper: group chats show the group's picture, and photos of new contacts
+  are filled in once Beeper has downloaded them.
+
 **1.2.1**
 - Follows Fenn's notch settings live: left/center/right, primary/secondary/
   follow-cursor monitor, margin, pill or notch shape.
