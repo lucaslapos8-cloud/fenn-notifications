@@ -40,7 +40,7 @@ DEFAULTS = {"popup": True, "seconds": 6, "hide_banners": False,
             "photos": True, "pill_badge": 1, "marker": 1,
             "sound_on": False, "sound": "b:message", "volume": 70, "app_sounds": {},
             "custom_sounds": [], "mute_windows_sounds": False, "saved_sounds": {},
-            "app_volumes": {}}
+            "app_volumes": {}, "color_emoji": True}
 settings = {**DEFAULTS, **(app.load("settings", {}) or {})}
 DURATIONS = [4, 6, 10, 20]
 STYLES = ["solid", "glass", "tinted"]
@@ -185,6 +185,7 @@ class Bubble:
         self.mtime = self._script_mtime()
         self._send_now(f"theme|{'dark' if app.dark else 'light'}|{app.accent}")
         self._send_now(config_line())
+        self._send_now(emoji_line())
         if layout_sent:
             self._send_now(layout_sent)  # where Fenn's notch is
         if marker_sent:
@@ -232,6 +233,10 @@ class Bubble:
 
 
 bubble = Bubble()
+
+
+def emoji_line():
+    return f"emoji|{1 if settings['color_emoji'] else 0}|{b64(os.path.join(app.data_dir, 'emoji'))}"
 
 
 def config_line():
@@ -520,6 +525,8 @@ def page_view():
             fenn.chips("pill_badge", BADGE_NAMES, min(2, max(0, int(settings.get("pill_badge", 1))))),
         ], gap=8),
         fenn.toggle("photos", settings["photos"], label="Sender photos (Beeper: from its local contact list)"),
+        fenn.toggle("color_emoji", settings["color_emoji"],
+                    label="Color emoji in the bubble (Twemoji pictures, downloaded once each)"),
         fenn.toggle("fullscreen", settings["fullscreen"], label="Also pop out over full-screen apps and games"),
         fenn.toggle("hide_banners", settings["hide_banners"],
                     label="Hide Windows banners (show them only here)"),
@@ -851,6 +858,14 @@ def on_files(msg):
         save_settings()
         play(sound_path(added))
         draw()
+
+
+@app.on("color_emoji")
+def on_color_emoji(e):
+    settings["color_emoji"] = bool(e.get("value"))
+    save_settings()
+    bubble.send(emoji_line())
+    draw()
 
 
 @app.on("fullscreen")

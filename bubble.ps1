@@ -9,6 +9,7 @@
 #   config|<solid|glass|tinted>|<size 0..4>|<tint 0..3>
 #   show|id|b64 app|b64 title|b64 body|b64 image|more|seconds|b64 when|b64 reply hint|b64 labels (0x1F separated)|b64 app icon badge
 #   marker|<none|dot|count>|<unread>
+#   emoji|<0/1>|b64 cache folder
 #   layout|<left|center|right>|<primary|secondary|cursor>|<margin>|<pill|notch>|<autohide 0/1>
 #   hide
 # and it answers on stdout: ready, click|id, dismiss|id, hidden|id,
@@ -53,6 +54,146 @@ public class Bubble : Window {
     readonly StackPanel buttons;
     readonly System.Windows.Shapes.Path closeGlyph;
     readonly DispatcherTimer tick;
+
+
+    // ---- color emoji
+    // WPF (on .NET Framework) draws emoji fonts in one color only, so emoji
+    // become small pictures: Twemoji PNGs, downloaded once each into the
+    // plugin's data folder (EmojiDir) and drawn inline with the text.
+    public static string EmojiDir = "";
+    public static bool ColorEmoji = true;
+    const string EmojiUrl = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/";
+    static readonly System.Collections.Generic.HashSet<string> emojiPending = new System.Collections.Generic.HashSet<string>();
+    static readonly System.Collections.Generic.HashSet<string> emojiFailed = new System.Collections.Generic.HashSet<string>();
+    string lastApp = "", lastTitle = "", lastBody = "";
+    int lastMore;
+
+    static bool IsEmojiStart(int cp) {
+        return (cp >= 0x1F000 && cp <= 0x1FAFF) || (cp >= 0x2600 && cp <= 0x27BF) || (cp >= 0x2300 && cp <= 0x23FF)
+            || (cp >= 0x2B00 && cp <= 0x2BFF) || cp == 0x203C || cp == 0x2049 || cp == 0x2934 || cp == 0x2935
+            || cp == 0x3030 || cp == 0x303D || cp == 0x3297 || cp == 0x3299 || cp == 0x00A9 || cp == 0x00AE || cp == 0x2122;
+    }
+
+    static bool IsEmojiJoiner(int cp) {
+        return cp == 0xFE0F || cp == 0x20E3 || (cp >= 0x1F3FB && cp <= 0x1F3FF) || (cp >= 0xE0020 && cp <= 0xE007F);
+    }
+
+    /// Splits text into plain parts and whole emoji sequences (ZWJ families,
+    /// skin tones, flags, keycaps stay together).
+    static System.Collections.Generic.List<string[]> SplitEmoji(string text) {
+        var parts = new System.Collections.Generic.List<string[]>();
+        var plain = new StringBuilder();
+        int i = 0;
+        while (i < text.Length) {
+            int cp = char.ConvertToUtf32(text, i);
+            int len = char.IsSurrogatePair(text, i) ? 2 : 1;
+            bool keycap = (cp == '#' || cp == '*' || (cp >= '0' && cp <= '9')) && i + len < text.Length
+                          && (text[i + len] == '\u20E3' || (text[i + len] == '\uFE0F' && i + len + 1 < text.Length && text[i + len + 1] == '\u20E3'));
+            bool flag = cp >= 0x1F1E6 && cp <= 0x1F1FF;
+            if (!IsEmojiStart(cp) && !keycap) { plain.Append(text, i, len); i += len; continue; }
+            if (plain.Length > 0) { parts.Add(new[] { "t", plain.ToString() }); plain.Clear(); }
+            int start = i;
+            i += len;
+            if (flag && i < text.Length) {
+                int next = char.ConvertToUtf32(text, i);
+                if (next >= 0x1F1E6 && next <= 0x1F1FF) i += char.IsSurrogatePair(text, i) ? 2 : 1;
+            }
+            while (i < text.Length) {
+                int c = char.ConvertToUtf32(text, i);
+                int l = char.IsSurrogatePair(text, i) ? 2 : 1;
+                if (IsEmojiJoiner(c)) { i += l; continue; }
+                if (c == 0x200D && i + 1 < text.Length) {
+                    i += 1;
+                    int c2 = char.ConvertToUtf32(text, i);
+                    i += char.IsSurrogatePair(text, i) ? 2 : 1;
+                    continue;
+                }
+                break;
+            }
+            parts.Add(new[] { "e", text.Substring(start, i - start) });
+        }
+        if (plain.Length > 0) parts.Add(new[] { "t", plain.ToString() });
+        return parts;
+    }
+
+    /// Twemoji file name: code points in hex joined by "-", without the
+    /// FE0F variation selector unless the sequence has a ZWJ in it.
+    static string EmojiName(string seq) {
+        bool zwj = seq.IndexOf('\u200D') >= 0;
+        var cps = new System.Collections.Generic.List<string>();
+        for (int i = 0; i < seq.Length; i += char.IsSurrogatePair(seq, i) ? 2 : 1) {
+            int cp = char.ConvertToUtf32(seq, i);
+            if (cp == 0xFE0F && !zwj) continue;
+            cps.Add(cp.ToString("x"));
+        }
+        return string.Join("-", cps);
+    }
+
+    ImageSource EmojiImage(string seq) {
+        if (!ColorEmoji || string.IsNullOrEmpty(EmojiDir)) return null;
+        string name = EmojiName(seq);
+        string path = System.IO.Path.Combine(EmojiDir, name + ".png");
+        if (File.Exists(path)) {
+            try {
+                var bmp = new BitmapImage();
+                bmp.BeginInit();
+                bmp.CacheOption = BitmapCacheOption.OnLoad;
+                bmp.UriSource = new Uri(path);
+                bmp.EndInit();
+                bmp.Freeze();
+                return bmp;
+            } catch { return null; }
+        }
+        if (emojiFailed.Contains(name) || !emojiPending.Add(name)) return null;
+        string id = current;
+        System.Threading.Tasks.Task.Run(() => {
+            try {
+                System.Net.ServicePointManager.SecurityProtocol |= System.Net.SecurityProtocolType.Tls12;
+                Directory.CreateDirectory(EmojiDir);
+                using (var wc = new System.Net.WebClient()) {
+                    wc.Headers.Add("User-Agent", "fenn-notifications");
+                    wc.DownloadFile(EmojiUrl + name + ".png", path + ".tmp");
+                }
+                if (File.Exists(path)) File.Delete(path + ".tmp"); else File.Move(path + ".tmp", path);
+                // Draw the message again with the picture, if it's still the one showing.
+                Dispatcher.BeginInvoke(new Action(() => { emojiPending.Remove(name); if (current == id && expanded) RenderTexts(); }));
+            } catch {
+                try { if (File.Exists(path + ".tmp")) File.Delete(path + ".tmp"); } catch { }
+                Dispatcher.BeginInvoke(new Action(() => { emojiPending.Remove(name); emojiFailed.Add(name); }));
+            }
+        });
+        return null;
+    }
+
+    /// Fills a TextBlock with text whose emoji are color pictures (or the
+    /// font's glyph while a picture is still being fetched).
+    void AddRich(InlineCollection inlines, string text, double size, Brush color, FontWeight weight) {
+        foreach (var part in SplitEmoji(text ?? "")) {
+            ImageSource img = part[0] == "e" ? EmojiImage(part[1]) : null;
+            if (img != null) {
+                var pic = new Image { Source = img, Width = size * 1.2, Height = size * 1.2, Margin = new Thickness(0.5, 0, 0.5, 0) };
+                RenderOptions.SetBitmapScalingMode(pic, BitmapScalingMode.HighQuality);
+                inlines.Add(new InlineUIContainer(pic) { BaselineAlignment = BaselineAlignment.Center });
+            } else {
+                var run = new Run(part[1]) { FontWeight = weight };
+                if (color != null) run.Foreground = color;
+                inlines.Add(run);
+            }
+        }
+    }
+
+    void RenderTexts() {
+        string title = string.IsNullOrEmpty(lastTitle) ? lastApp : lastTitle;
+        titleText.Inlines.Clear();
+        AddRich(titleText.Inlines, title, titleText.FontSize, null, FontWeights.SemiBold);
+        bodyText.Inlines.Clear();
+        AddRich(bodyText.Inlines, lastBody, bodyText.FontSize, null, FontWeights.Normal);
+        bodyText.Visibility = string.IsNullOrEmpty(lastBody) ? Visibility.Collapsed : Visibility.Visible;
+        cText.Inlines.Clear();
+        AddRich(cText.Inlines, title, cText.FontSize, null, FontWeights.SemiBold);
+        if (!string.IsNullOrEmpty(lastBody)) AddRich(cText.Inlines, "  " + lastBody.Replace("\n", " "), cText.FontSize, bodyText.Foreground, FontWeights.Normal);
+        if (lastMore > 0) cText.Inlines.Add(new Run("  +" + lastMore) { Foreground = moreText.Foreground, FontWeight = FontWeights.SemiBold });
+    }
 
     public Marker marker;
     public bool IsOut { get { return IsVisible && (expanded || collapsing); } }
@@ -605,13 +746,8 @@ public class Bubble : Window {
         appText.Text = app;
         whenText.Text = when;
         moreText.Text = more > 0 ? "+" + more + " more" : "";
-        titleText.Text = string.IsNullOrEmpty(title) ? app : title;
-        bodyText.Text = body ?? "";
-        bodyText.Visibility = string.IsNullOrEmpty(body) ? Visibility.Collapsed : Visibility.Visible;
-        cText.Inlines.Clear();
-        cText.Inlines.Add(new Run(string.IsNullOrEmpty(title) ? app : title) { FontWeight = FontWeights.SemiBold });
-        if (!string.IsNullOrEmpty(body)) cText.Inlines.Add(new Run("  " + body.Replace("\n", " ")) { Foreground = bodyText.Foreground });
-        if (more > 0) cText.Inlines.Add(new Run("  +" + more) { Foreground = moreText.Foreground, FontWeight = FontWeights.SemiBold });
+        lastApp = app; lastTitle = title; lastBody = body ?? ""; lastMore = more;
+        RenderTexts();
         SetAvatar(image, app);
         var badgeBrush = LoadBrush(badge, 48);
         appBadgeRing.Visibility = cAppBadgeRing.Visibility = badgeBrush != null ? Visibility.Visible : Visibility.Collapsed;
@@ -826,6 +962,13 @@ public class Bubble : Window {
                     string hint = f.Length > 9 ? D(f[9]) : "";
                     string[] labels = f.Length > 10 && f[10].Length > 0 ? D(f[10]).Split((char)0x1F) : new string[0];
                     Pop(f[1], D(f[2]), D(f[3]), D(f[4]), D(f[5]), more, secs, D(f[8]), hint, labels, f.Length > 11 ? D(f[11]) : "");
+                }
+                break;
+            case "emoji":
+                // emoji|<1 = color pictures, 0 = font glyphs>|b64 folder to cache them in
+                if (f.Length >= 3) {
+                    ColorEmoji = f[1] == "1";
+                    EmojiDir = D(f[2]);
                 }
                 break;
             case "layout":

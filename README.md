@@ -84,10 +84,14 @@ reach the island either. Turn them back on (banners can stay off).
 
 - Message text stays in memory only and is never written to disk. The data
   folder (`FENN_DATA_DIR`) holds settings and cached app icons.
-- The plugin makes no network calls of its own, with one exception: if a
-  notification's picture is a web address (some apps send sender avatars this
-  way), the plugin downloads that one image so it can show it, and caches it
-  in its data folder.
+- The plugin makes only two kinds of network calls, both downloads that are
+  cached in its data folder:
+  - if a notification's picture is a web address (some apps send sender
+    avatars this way), that one image;
+  - **color emoji:** the bubble can't draw color emoji from the font, so each
+    emoji in a message is fetched once as a picture from
+    `cdn.jsdelivr.net/gh/jdecked/twemoji` (only the emoji's code is sent, never
+    the message). Switch off "Color emoji" to skip it.
 - **Sender photos for Beeper:** Beeper's notifications carry no picture, so
   the plugin looks the sender's name up in Beeper's local database
   (`%APPDATA%\BeeperTexts\index.db`, read-only, contacts table only) and copies
@@ -115,7 +119,8 @@ reach the island either. Turn them back on (banners can stay off).
 ## License
 
 MIT, see [LICENSE](LICENSE). `fenn.py` is Fenn's plugin helper (MIT, © The
-Nook contributors).
+Nook contributors). Color emoji are [Twemoji](https://github.com/jdecked/twemoji)
+graphics (CC-BY 4.0, © Twitter, Inc. and other contributors), downloaded at runtime.
 
 ## Changelog
 
