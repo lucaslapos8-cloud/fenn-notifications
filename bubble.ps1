@@ -7,13 +7,15 @@
 # main.py drives it over stdin, one command per line:
 #   theme|dark|#RRGGBB
 #   config|<solid|glass|tinted>|<size 0..4>|<tint 0..3>
-#   show|id|b64 app|b64 title|b64 body|b64 image|more|seconds|b64 when|b64 reply hint|b64 labels (0x1F separated)|b64 app icon badge|muted 0/1
+#   show|id|b64 app|b64 title|b64 body|b64 image|more|seconds|b64 when|b64 reply hint|b64 labels (0x1F separated)|b64 app icon badge|muted 0/1|call 0/1|silent call 0/1
+#   ring|b64 sound file|volume 0..100|loop 0/1   (a call's ringtone; WPF plays MP3, WAV, M4A, WMA...)
+#   ringstop
 #   marker|<none|dot|count>|<unread>
 #   emoji|<0/1>|b64 cache folder
 #   layout|<left|center|right>|<primary|secondary|cursor>|<margin>|<pill|notch>|<autohide 0/1>
 #   hide
 # and it answers on stdout: ready, click|id, dismiss|id, hidden|id,
-# reply|id|b64 text, action|id|index, mute|id|<15|60|forever|off>
+# reply|id|b64 text, action|id|index, mute|id|<15|60|forever|off>, call|id|<accept|decline|mute>
 
 $ErrorActionPreference = 'Stop'
 Add-Type -ReferencedAssemblies PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Drawing -TypeDefinition @'
@@ -243,6 +245,8 @@ public class Bubble : Window {
     static readonly byte[] TintAlpha = { 0xC4, 0xA6, 0x86, 0x66 };
     int size = 2;
     bool expanded, hovering, collapsing, hoverOpen, typing, hasExtras;
+    bool pinned;          // a ringing call: its buttons stay out until answered, declined or it stops
+    MediaPlayer ringer;   // the call's ringtone
     DateTime collapseAt;
     Color accent = Color.FromRgb(0x7C, 0x5C, 0xFF);
     bool dark = true;
@@ -501,6 +505,9 @@ public class Bubble : Window {
         actionsRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         actionsRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         actionsRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        // A reply box gets the whole line; the buttons then go on a line below it.
+        actionsRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        actionsRow.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         Grid.SetRow(actionsRow, 1);
         content.Children.Add(actionsRow);
 
@@ -571,13 +578,13 @@ public class Bubble : Window {
             hovering = false;
             Fade(closeBtn, 0, 160);
             if (collapseAt < DateTime.Now.AddSeconds(1.5)) collapseAt = DateTime.Now.AddSeconds(1.5);
-            if (hoverOpen && !typing && reply.Text.Length == 0 && expanded && !collapsing) { hoverOpen = false; Relayout(HoverMs); }
+            if (!pinned && hoverOpen && !typing && reply.Text.Length == 0 && expanded && !collapsing) { hoverOpen = false; Relayout(HoverMs); }
         };
         card.MouseRightButtonUp += (s, e) => Dismiss();
         Deactivated += (s, e) => {
             typing = false;
             NoActivate(true);
-            if (!hovering && hoverOpen && reply.Text.Length == 0 && expanded && !collapsing) { hoverOpen = false; Relayout(HoverMs); }
+            if (!pinned && !hovering && hoverOpen && reply.Text.Length == 0 && expanded && !collapsing) { hoverOpen = false; Relayout(HoverMs); }
         };
 
         tick = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
@@ -682,6 +689,13 @@ public class Bubble : Window {
     }
 
     void StyleButton(Border b) {
+        if (b.Tag is Color) {  // a call's Accept (green) or Decline (red)
+            var c = (Color)b.Tag;
+            b.Background = new SolidColorBrush(c);
+            b.BorderBrush = new SolidColorBrush(c);
+            ((TextBlock)b.Child).Foreground = Brushes.White;
+            return;
+        }
         b.Background = Overlay(0x24);
         b.BorderBrush = Overlay(0x22);
         ((TextBlock)b.Child).Foreground = dark ? Brushes.White : B(0xFF, 0x15, 0x15, 0x1A);
@@ -788,7 +802,7 @@ public class Bubble : Window {
 
     // ------------------------------------------------------------------ show / hide
 
-    public void Pop(string id, string app, string title, string body, string image, int more, double seconds, string when, string hint, string[] labels, string badge, bool muted) {
+    public void Pop(string id, string app, string title, string body, string image, int more, double seconds, string when, string hint, string[] labels, string badge, bool muted, bool call, bool silent) {
         current = id;
         appText.Text = app;
         whenText.Text = when;
@@ -807,6 +821,15 @@ public class Bubble : Window {
         replyHint.Text = hint;
         reply.Text = "";
         buttons.Children.Clear();
+        pinned = call;
+        if (call) {
+            // A call: Accept, Decline and Mute (the ringtone), out until one is used.
+            replyBox.Visibility = sendBtn.Visibility = Visibility.Collapsed;
+            buttons.Children.Add(CallPill("Accept", "accept", Color.FromRgb(0x2E, 0xBD, 0x59)));
+            buttons.Children.Add(CallPill("Decline", "decline", Color.FromRgb(0xE5, 0x48, 0x4D)));
+            buttons.Children.Add(CallPill(silent ? "Muted" : "Mute", "mute", null));
+            labels = new string[0];
+        }
         for (int i = 0; i < labels.Length; i++) {
             if (labels[i].Length == 0) continue;
             int index = i;
@@ -820,16 +843,25 @@ public class Bubble : Window {
             buttons.Children.Add(b);
         }
         // Our own button: mute this app for a while (replaces e.g. "Remind in 1 Hour").
-        var mutePill = Pill(muted ? "Muted" : "Mute for", ToggleMuteMenu);
-        muteLabel = (TextBlock)mutePill.Child;
-        buttons.Children.Add(mutePill);
-        BuildMuteMenu(muted);
+        if (!call) {
+            var mutePill = Pill(muted ? "Muted" : "Mute for", ToggleMuteMenu);
+            muteLabel = (TextBlock)mutePill.Child;
+            buttons.Children.Add(mutePill);
+            BuildMuteMenu(muted);
+        }
+        bool own = replyBox.Visibility == Visibility.Visible && buttons.Children.Count > 0;
+        Grid.SetRow(buttons, own ? 1 : 0);
+        Grid.SetColumn(buttons, own ? 0 : 2);
+        Grid.SetColumnSpan(buttons, own ? 3 : 1);
+        buttons.HorizontalAlignment = own ? HorizontalAlignment.Left : HorizontalAlignment.Stretch;
+        buttons.Margin = own ? new Thickness(-6, 8, 0, 0) : new Thickness(0);
         muteRow.Visibility = Visibility.Collapsed;
         hasExtras = true;
         collapseAt = DateTime.Now.AddSeconds(Math.Max(2, seconds));
 
         if (expanded && !collapsing) {
             // Already open: a small bounce and a cross-fade to the new message.
+            hoverOpen = pinned || hoverOpen;
             ShowLayout();
             var t2 = Target();
             Grow(card, t2.Width, t2.Height, 300, new BackEase { Amplitude = 0.5, EasingMode = EasingMode.EaseOut });
@@ -840,7 +872,7 @@ public class Bubble : Window {
         }
         collapsing = false;
         expanded = true;
-        hoverOpen = false;
+        hoverOpen = pinned;
         typing = false;
         Place();
         CaptureBackdrop();
@@ -915,8 +947,45 @@ public class Bubble : Window {
         Collapse();
     }
 
+    Border CallPill(string label, string what, Color? fill) {
+        var t = new TextBlock { Text = label, FontSize = 12, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center };
+        var b = new Border { CornerRadius = new CornerRadius(15), Height = 30, Padding = new Thickness(15, 0, 15, 0), Margin = new Thickness(6, 0, 0, 0),
+                             BorderThickness = new Thickness(1), Cursor = Cursors.Hand, Child = t };
+        if (fill.HasValue) b.Tag = fill.Value;
+        StyleButton(b);
+        b.MouseEnter += (s, e) => { if (fill.HasValue) b.Opacity = 0.85; else b.Background = Overlay(0x3A); };
+        b.MouseLeave += (s, e) => { if (fill.HasValue) b.Opacity = 1; else b.Background = Overlay(0x24); };
+        b.MouseLeftButtonUp += (s, e) => {
+            e.Handled = true;
+            Say("call|" + current + "|" + what);
+            StopRing();
+            if (what == "mute") { t.Text = "Muted"; return; }
+            pinned = false;
+            Collapse();
+        };
+        return b;
+    }
+
+    public void Ring(string path, double volume, bool loop) {
+        StopRing();
+        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+        var p = new MediaPlayer();
+        p.Volume = Math.Max(0, Math.Min(1, volume));
+        if (loop) p.MediaEnded += (s, e) => { p.Position = TimeSpan.Zero; p.Play(); };
+        p.Open(new Uri(path));
+        p.Play();
+        ringer = p;
+    }
+
+    public void StopRing() {
+        if (ringer == null) return;
+        try { ringer.Stop(); ringer.Close(); } catch { }
+        ringer = null;
+    }
+
     public void Collapse() {
         if (!expanded || collapsing) return;
+        pinned = false;
         collapsing = true;
         typing = false;
         NoActivate(true);
@@ -1015,7 +1084,7 @@ public class Bubble : Window {
                     string hint = f.Length > 9 ? D(f[9]) : "";
                     string[] labels = f.Length > 10 && f[10].Length > 0 ? D(f[10]).Split((char)0x1F) : new string[0];
                     Pop(f[1], D(f[2]), D(f[3]), D(f[4]), D(f[5]), more, secs, D(f[8]), hint, labels, f.Length > 11 ? D(f[11]) : "",
-                        f.Length > 12 && f[12] == "1");
+                        f.Length > 12 && f[12] == "1", f.Length > 13 && f[13] == "1", f.Length > 14 && f[14] == "1");
                 }
                 break;
             case "emoji":
@@ -1048,6 +1117,15 @@ public class Bubble : Window {
                 break;
             case "hide":
                 Collapse();
+                break;
+            case "ring":
+                if (f.Length >= 3) {
+                    double vol; double.TryParse(f[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out vol);
+                    Ring(D(f[1]), vol / 100.0, f.Length < 4 || f[3] != "0");
+                }
+                break;
+            case "ringstop":
+                StopRing();
                 break;
             case "quit":
                 Application.Current.Shutdown();

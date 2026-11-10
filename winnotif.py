@@ -13,6 +13,7 @@ sqlite3, winreg), so it runs on a plain Python install.
 import ctypes
 import ctypes.wintypes as wt
 import os
+import json
 import re
 import sqlite3
 import struct
@@ -22,6 +23,7 @@ import urllib.parse
 import urllib.request
 import winreg
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 import zlib
 
 DB_PATH = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db")
@@ -86,12 +88,30 @@ class NotificationFeed:
             self.max_id = max(self.max_id, nid or 0)
             if isinstance(payload, bytes):
                 payload = payload.decode("utf-8", "replace")
+            payload = self.fill_data(nid, payload or "")
             out.append({"order": nid, "id": nid, "aumid": aumid, "tag": tag or "",
                         "group": group or "", "arrival": arrival, "payload": payload or ""})
         if len(self.seen) > 2000:  # keep only what the look-back window can return
             cutoff = self.since - self.WINDOW * 2
             self.seen = {k for k in self.seen if (k[1] or 0) >= cutoff or (k[0] or 0) >= self.max_id - 50}
         return out
+
+    def fill_data(self, nid, payload):
+        """Fills a toast's data-binding placeholders ({contactName}, as in
+        Phone Link's call toasts) with the values Windows keeps for it in
+        NotificationData. Placeholders without a value are removed."""
+        if "{" not in payload:
+            return payload
+        try:
+            data = dict(self._connect().execute(
+                "select Key, Value from NotificationData where NotificationId = ?", (nid,)).fetchall())
+        except sqlite3.Error:
+            data = {}
+
+        def value(m):
+            v = data.get(m.group(1))
+            return xml_escape(str(v), {'"': "&quot;"}) if v is not None else ""
+        return re.sub(r"\{([A-Za-z_][\w.]*)\}", value, payload)
 
     def apps_with_toasts(self):
         """AppUserModelIDs that have notifications in the notification center now."""
@@ -123,9 +143,10 @@ class NotificationFeed:
 
 def parse_toast(payload):
     """Toast XML -> dict(title, body, attribution, image, launch, activation,
-    actions, inputs, silent). Unknown shapes degrade to plain text."""
+    actions, menu (right-click items), inputs, silent). Unknown shapes degrade
+    to plain text."""
     info = {"title": "", "body": "", "attribution": "", "image": None, "hero": None,
-            "launch": "", "activation": "foreground", "actions": [], "inputs": [],
+            "launch": "", "activation": "foreground", "actions": [], "menu": [], "inputs": [],
             "silent": False, "scenario": ""}
     try:
         root = ET.fromstring(payload)
@@ -164,21 +185,44 @@ def parse_toast(payload):
     audio = root.find("audio")
     if audio is not None and audio.get("silent") == "true":
         info["silent"] = True
+    info["audio"] = audio.get("src", "") if audio is not None else ""
     actions = root.find("actions")
     if actions is not None:
         for inp in actions.findall("input"):
             info["inputs"].append({"id": inp.get("id", ""), "type": inp.get("type", "text"),
                                    "hint": inp.get("placeHolderContent", "")})
         for act in actions.findall("action"):
-            if act.get("placement") == "contextMenu":
-                continue
-            info["actions"].append({
+            # Right-click menu items (WhatsApp's "Mark as read") go in their own list.
+            into = info["menu"] if act.get("placement") == "contextMenu" else info["actions"]
+            into.append({
                 "content": act.get("content", ""),
                 "arguments": act.get("arguments", ""),
                 "activation": (act.get("activationType") or "foreground").lower(),
                 "input": act.get("hint-inputId", ""),
             })
     return info
+
+
+CALL_WORDS = re.compile(r"\bincoming\s+(?:voice\s+|video\s+|audio\s+|group\s+)?call\b|\bis\s+calling\b"
+                        r"|\bcalling\s+you\b|\bvideo\s+call\b|\bvoice\s+call\b", re.I)
+CALL_ACTIONS = re.compile(r"(?:accept|answer|decline|reject|ignore)[\w-]*call|call[\w-]*(?:accept|answer|decline|reject)"
+                          r"|incomingcall", re.I)
+
+
+def is_call(info, tag="", group=""):
+    """Whether a toast is a phone or app call, from any app: the toast's
+    call scenario or ringtone, call buttons (accept / decline), a call tag,
+    or words like "Incoming call" / "is calling"."""
+    if info.get("scenario", "").lower() == "incomingcall":
+        return True
+    if "looping.call" in info.get("audio", "").lower():
+        return True
+    args = " ".join([info.get("launch", "")] + [a["arguments"] + " " + a["content"] for a in info["actions"]])
+    if CALL_ACTIONS.search(args):
+        return True
+    if re.search(r"call", f"{tag} {group}", re.I) and info["actions"]:
+        return True
+    return bool(CALL_WORDS.search(f"{info.get('title', '')} {info.get('body', '')}"))
 
 
 def click_arguments(note):
@@ -525,10 +569,33 @@ def toast_activator(aumid):
         clsid = _property(aumid, PKEY_ToastActivatorCLSID)
     if not clsid:
         clsid = _shortcut_activators().get(aumid.lower())
+    if not clsid and "!" in aumid:
+        clsid = _manifest_activator(aumid)
     if clsid and clsid.strip("{}").replace("0", "").replace("-", "") == "":
         clsid = None
     _activators[aumid] = clsid
     return clsid
+
+
+def _manifest_activator(aumid):
+    """A packaged desktop app (WhatsApp, ...) declares its toast activator in
+    its AppxManifest.xml, not on the Start menu entry. Without it a reply
+    could only launch the app, and the typed text would be lost."""
+    folder = app_folder(aumid)
+    if not folder:
+        return None
+    try:
+        root = ET.parse(os.path.join(folder, "AppxManifest.xml")).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    app_id = aumid.split("!", 1)[1]
+    apps = [e for e in root.iter() if e.tag.rsplit("}", 1)[-1] == "Application"]
+    apps.sort(key=lambda e: e.get("Id") != app_id)  # this entry first, then the others
+    for app in apps:
+        for e in app.iter():
+            if e.tag.rsplit("}", 1)[-1] == "ToastNotificationActivation" and e.get("ToastActivatorCLSID"):
+                return "{" + e.get("ToastActivatorCLSID").strip("{}").upper() + "}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -895,3 +962,148 @@ def mute_windows_sounds(mute, saved):
         except OSError:
             pass
     return out
+
+
+# ---------------------------------------------------------------------------
+# Ringtones for calls
+
+RINGTONES = [(f"ring{i:02d}", f"Ring {i}", f"Ring{i:02d}.wav") for i in range(1, 11)] + [
+    ("ringin", "Classic ring", "Windows Ringin.wav")]
+RING_TYPES = SOUND_FILE_TYPES + (".ogg", ".opus")
+_ring_cache = {}  # aumid -> (path, where it came from)
+
+
+def windows_event_sound(event):
+    """The file Windows plays for a sound event (Control Panel > Sound),
+    e.g. Notification.Looping.Call -> Windows' Ring01.wav."""
+    path = _reg_value(winreg.HKEY_CURRENT_USER, rf"{SOUND_EVENTS_KEY}\{event}\.Current", "")
+    path = os.path.expandvars(path or "")
+    if path and os.path.isfile(path):
+        return path
+    m = re.search(r"Looping\.Call(\d*)$", event)
+    if m:  # Windows' defaults: Call -> Ring01, Call2 -> Ring02 ...
+        guess = os.path.join(MEDIA, f"Ring{int(m.group(1) or 1):02d}.wav")
+        if os.path.isfile(guess):
+            return guess
+    return None
+
+
+PKEY_PackageInstallPath = pkey("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}", 15)
+PKEY_LinkTarget = pkey("{B9B4B3FC-2B51-4A42-B5D8-324146AFCF25}", 2)
+
+
+def app_folder(aumid):
+    """Where an app is installed: a Store app's package folder, or the
+    folder of the program its Start menu entry points to."""
+    path = _property(aumid, PKEY_PackageInstallPath)
+    if path and os.path.isdir(path):
+        return path
+    target = _property(aumid, PKEY_LinkTarget)
+    if target and os.path.isfile(target):
+        return os.path.dirname(target)
+    if "!" in aumid:  # a packaged app's other entry (e.g. Phone Link's calls)
+        family = aumid.split("!")[0]
+        for k in (family + "!App",):
+            path = _property(k, PKEY_PackageInstallPath)
+            if path and os.path.isdir(path):
+                return path
+    return None
+
+
+def _ring_score(name):
+    """How much a sound file's name looks like an incoming-call ringtone."""
+    n = name.lower()
+    if "ring" not in n and "incoming" not in n:
+        return 0
+    if any(w in n for w in ("ringout", "ringback", "outgoing", "hangup", "hang_up", "end", "dial", "busy")):
+        return 0
+    return 3 if "ringtone" in n else 2 if "incoming" in n else 1
+
+
+def _search_folder(folder, limit=40000):
+    best, seen = (0, None), 0
+    for root, dirs, files in os.walk(folder):
+        depth = root[len(folder):].count(os.sep)
+        if depth >= 5:
+            dirs[:] = []
+        dirs[:] = [d for d in dirs if d.lower() not in ("node_modules", "locales", "swiftshader")]
+        for f in files:
+            seen += 1
+            if f.lower().endswith(RING_TYPES):
+                s = _ring_score(f)
+                if s > best[0]:
+                    best = (s, os.path.join(root, f))
+        if seen > limit:
+            break
+    return best
+
+
+def _search_asar(asar, cache_dir):
+    """Electron apps keep their files in resources/app.asar: find a ringtone
+    in its index and copy it out."""
+    try:
+        with open(asar, "rb") as f:
+            head = f.read(16)
+            size = struct.unpack("<I", head[12:16])[0]
+            index = json.loads(f.read(size).decode("utf-8"))
+            base = 8 + struct.unpack("<I", head[4:8])[0]
+            best = (0, None, None)
+
+            def walk(node, path):
+                nonlocal best
+                for name, v in (node.get("files") or {}).items():
+                    if "files" in v:
+                        walk(v, path + "/" + name)
+                    elif name.lower().endswith(RING_TYPES) and not v.get("unpacked"):
+                        s = _ring_score(name)
+                        if s > best[0]:
+                            best = (s, name, v)
+            walk(index, "")
+            if not best[1]:
+                return (0, None)
+            os.makedirs(cache_dir, exist_ok=True)
+            out = os.path.join(cache_dir, "ring-" + re.sub(r"[^\w.-]", "_", best[1]))
+            if not os.path.isfile(out):
+                f.seek(base + int(best[2]["offset"]))
+                data = f.read(int(best[2]["size"]))
+                with open(out, "wb") as o:
+                    o.write(data)
+            return (best[0], out)
+    except (OSError, ValueError, KeyError, struct.error):
+        return (0, None)
+
+
+def app_ringtone(aumid, info, cache_dir):
+    """The ringtone an app uses for calls, as a file: the sound its call
+    notification names, a ringtone in the app's own folder (or inside an
+    Electron app's app.asar), or Windows' call sound. -> (path, where)."""
+    audio = (info or {}).get("audio", "")
+    if audio.startswith("ms-winsoundevent:"):
+        path = windows_event_sound(audio.split(":", 1)[1])
+        if path:
+            return path, "the sound its call notification uses"
+    folder = None
+    if audio.startswith("ms-appx:///") or audio.startswith("file:///"):
+        folder = app_folder(aumid)
+        rel = urllib.parse.unquote(audio.split(":///", 1)[1]).replace("/", os.sep)
+        path = os.path.join(folder, rel) if audio.startswith("ms-appx") and folder else rel
+        if path and os.path.isfile(path):
+            return path, "the sound its call notification uses"
+    if aumid in _ring_cache:
+        return _ring_cache[aumid]
+    found = (None, "")
+    folder = folder or app_folder(aumid)
+    if folder:
+        score, path = _search_folder(folder)
+        asar = os.path.join(folder, "resources", "app.asar")
+        if os.path.isfile(asar):
+            s2, p2 = _search_asar(asar, cache_dir)
+            if s2 > score:
+                score, path = s2, p2
+        if path:
+            found = (path, "the app's own ringtone")
+    if not found[0]:
+        path = windows_event_sound("Notification.Looping.Call")
+        found = (path, "Windows' call sound (the app has none of its own)")
+    _ring_cache[aumid] = found
+    return found

@@ -11,6 +11,7 @@ recent notifications and the settings."""
 import base64
 import ctypes
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -41,7 +42,12 @@ DEFAULTS = {"popup": True, "seconds": 6, "hide_banners": False,
             "sound_on": False, "sound": "b:message", "volume": 70, "app_sounds": {},
             "custom_sounds": [], "mute_windows_sounds": False, "saved_sounds": {},
             "app_volumes": {}, "color_emoji": True, "known_apps": {},
-            "mute_until": {}}  # aumid -> unix time the mute ends, 0 = until unmuted
+            "mute_until": {},  # aumid -> unix time the mute ends, 0 = until unmuted
+            # Calls: a looping ringtone ("app" = the app's own), its volume, how long it rings,
+            # and each app's own ringtone and volume.
+            "ring_on": False, "ringtone": "app", "ring_volume": 80, "ring_seconds": 45,
+            "app_rings": {}, "app_ring_volumes": {},
+            "calls_muted": []}  # apps whose calls are off: no bubble, no ringtone (still in the history)
 settings = {**DEFAULTS, **(app.load("settings", {}) or {})}
 for _a in settings.get("muted", []):
     settings["mute_until"].setdefault(_a, 0)
@@ -111,6 +117,93 @@ def app_volume(aumid):
 def play(path, volume=None):
     if path:
         player.play(path, settings["volume"] if volume is None else volume)
+
+
+RING_SECONDS = [20, 30, 45, 60]
+preview_until = 0.0  # a ringtone test plays until then
+
+
+def ring_library():
+    """[(key, name, path)]: the app's own, Windows' ringtones, then the user's own files."""
+    out = [("app", "App\u2019s own", None)]
+    out += [("w:" + k, name, os.path.join(wn.MEDIA, f)) for k, name, f in wn.RINGTONES
+            if os.path.isfile(os.path.join(wn.MEDIA, f))]
+    for c in settings["custom_sounds"]:
+        if os.path.isfile(c["path"]):
+            out.append(("f:" + c["path"], c["name"], c["path"]))
+    return out
+
+
+def ring_name(key):
+    if key == "default":
+        return "Default"
+    if key == "none":
+        return "No ringtone"
+    return next((n for k, n, _ in ring_library() if k == key), "App\u2019s own")
+
+
+def ring_path(key, aumid, info=None):
+    """The file for a ringtone key ("app" looks up the app's own)."""
+    if key == "app":
+        return wn.app_ringtone(aumid, info, cache)[0]
+    return next((path for k, _, path in ring_library() if k == key), None)
+
+
+def app_ring_key(aumid):
+    key = settings["app_rings"].get(aumid, "default")
+    return settings["ringtone"] if key == "default" else key
+
+
+def ring_volume(aumid):
+    return settings["app_ring_volumes"].get(aumid, settings["ring_volume"])
+
+
+def start_ring(n):
+    """A call came in: its buttons show until it's answered, declined or
+    gone, and its ringtone loops (in the bubble process) for a while."""
+    n["ringing"], n["silenced"], n["ring_at"] = True, False, time.monotonic()
+    key = app_ring_key(n["aumid"])
+    path = ring_path(key, n["aumid"], n["info"]) if settings["ring_on"] and key != "none" else None
+    if path:
+        bubble.send(f"ring|{b64(path)}|{ring_volume(n['aumid'])}|1")
+    else:
+        n["silenced"] = True
+
+
+def end_ring(n=None):
+    """Stops the ringtone; with a note, that call's buttons go too."""
+    bubble.send("ringstop")
+    for x in ([n] if n else notes):
+        if x.get("ringing"):
+            x["ringing"] = False
+            x["silenced"] = True
+
+
+CALL_ACCEPT = re.compile(r"accept|answer|pick\s*up|join", re.I)
+CALL_DECLINE = re.compile(r"decline|reject|ignore|dismiss|hang\s*up|end\s*call", re.I)
+
+
+def call_action(n, what):
+    """Accept, Decline or Mute a call, from the bubble or the list."""
+    app.log(f"call: {what} ({n['app']})")
+    if what == "mute":
+        n["silenced"] = True
+        bubble.send("ringstop")
+        draw()
+        return
+    end_ring(n)
+    acts = n["info"]["actions"]
+    want = CALL_ACCEPT if what == "accept" else CALL_DECLINE
+    act = next((a for a in acts if want.search(a["content"] + " " + a["arguments"])), None)
+    if act:
+        run_action(n, act)  # the app's own Accept / Decline
+    elif what == "accept":
+        open_note(n)  # no Accept button in the toast: bring the call up in the app
+    else:
+        n["unread"] = False  # nothing to tell the app: just stop ringing here
+    if showing is n:
+        bubble.send("hide")
+    draw()
 
 
 MUTE_OPTIONS = [("off", "Unmute"), ("15", "15 minutes"), ("60", "1 hour"), ("forever", "Until I unmute")]
@@ -379,7 +472,18 @@ def reply_input(note):
 def bubble_buttons(note):
     """The toast's own buttons shown on hover (the reply box has its own send)."""
     # One of the app's own (e.g. Mark as Read); the bubble adds "Mute for" itself.
-    return [a for a in note["info"]["actions"] if a["content"] and not a["input"]][:1]
+    own = [a for a in note["info"]["actions"] if a["content"] and not a["input"]]
+    # No button of its own (WhatsApp keeps its actions in the right-click
+    # menu, e.g. "Mute chat for 8 hours"): use the first menu item, never "turn off".
+    menu = [a for a in note["info"].get("menu", [])
+            if a["content"] and not MENU_SKIP.search(a["content"] + " " + a["arguments"])]
+    return (own or menu)[:1]
+
+
+# Menu items that would switch the app's notifications off or open settings
+# (labels follow the app's language, e.g. WhatsApp's "Zastaviť upozornenia").
+MENU_SKIP = re.compile(r"disable|turn\s*off|\bstop|settings|vypn|zastav|nastaven|ausschalten|beenden|einstellungen"
+                       r"|d[eé]sactiv|desactiv|arr[eê]t|disattiv|wy[lł][aą]cz|zatrzym|vypnout", re.I)
 
 
 def pop(note):
@@ -391,13 +495,19 @@ def pop(note):
     body = clip(info["body"] or info["attribution"], 220)
     inp = reply_input(note)
     hint = (inp["hint"] or "Reply") if inp else ""
-    labels = chr(0x1F).join(clip(a["content"], 16) for a in bubble_buttons(note))
+    labels = chr(0x1F).join(clip(a["content"], 24) for a in bubble_buttons(note))
+    call = bool(note.get("ringing"))
+    if call:
+        hint, labels = "", ""
     bubble.send("|".join([
         "show", str(note["order"]), b64(note["app"]), b64(clip(info["title"], 90)), b64(body),
-        b64(note["image"] or note["icon"] or ""), str(others), str(settings["seconds"]), b64(ago(note["at"])),
+        b64(note["image"] or note["icon"] or ""), str(others),
+        str(settings["ring_seconds"] if call else settings["seconds"]), b64(ago(note["at"])),
         b64(hint), b64(labels) if labels else "",
         b64(note["icon"] if note["image"] and note["icon"] else ""),  # small app icon on the sender's photo
         "1" if is_muted(note["aumid"]) else "0",
+        "1" if call else "0",  # a ringing call: Accept, Decline and Mute stay out
+        "1" if note.get("silenced") else "0",  # it isn't ringing (app's calls muted, or no ringtone)
     ]))
 
 
@@ -466,6 +576,18 @@ def conversation_row(latest, group, last):
     return fenn.column(rows, gap=2) if len(rows) > 1 else rows[0]
 
 
+def call_pills(n, w):
+    """[(x0, x1, what, label, fill)] for a ringing call's buttons in its row."""
+    items = [("accept", "Accept", "#2EBD59"), ("decline", "Decline", "#E5484D"),
+             ("mute", "Muted" if n.get("silenced") else "Mute", "#8080803A")]
+    out, x = [], w - 2
+    for what, label, fill in reversed(items):
+        width = len(label) * 11.5 * 0.56 + 22
+        out.insert(0, (x - width, x, what, label, fill))
+        x -= width + 6
+    return out
+
+
 def older_line(n, last_one):
     """One older message, indented under the name; clicking opens the chat."""
     text = n["info"]["body"] or n["info"]["title"] or n["app"]
@@ -502,6 +624,9 @@ def header_row(latest, group, last, many, open_):
     row_width = w
     time_w = len(trailing) * 11.5 * 0.55 + 12
     msg_w = w - 8 - (CHEVRON_W if many else 0)
+    pills = call_pills(latest, w) if latest.get("ringing") else []
+    if pills:
+        msg_w = pills[0][0] - 10
     shapes = [
         # Rows are top-aligned (a centred row in Fenn takes all the height it
         # can get), so the text is placed to sit level with the 40 pt photo.
@@ -509,7 +634,11 @@ def header_row(latest, group, last, many, open_):
         fenn.label(w - 2, 11, trailing, size=11.5, color="accent" if unread else "faint", anchor="end"),
         fenn.label(2, 30, fit(message, msg_w, 12.5), size=12.5, color="dim"),
     ]
-    if many:
+    for x0, x1, what, label, fill in pills:  # a ringing call's Accept, Decline and Mute
+        shapes.append(fenn.rect(x0, 19, x1 - x0, 22, fill=fill, radius=11))
+        shapes.append(fenn.label((x0 + x1) / 2, 30, label, size=11.5, bold=True,
+                                 color="#FFFFFF" if what != "mute" else "text", anchor="center"))
+    if many and not pills:
         # How many, and a chevron that opens the older ones (clicks here don't open the chat).
         shapes.append(fenn.label(w - 22, 30, str(len(group)), size=11.5, color="faint", anchor="end"))
         shapes.append(fenn.glyph(w - 10, 30, "caret-up" if open_ else "caret-down", size=13, color="dim"))
@@ -526,7 +655,7 @@ def header_row(latest, group, last, many, open_):
     ], gap=10)
 
 
-TAB_NAMES = ["Bubble", "Options", "Sounds"]
+TAB_NAMES = ["Bubble", "Options", "Sounds", "Calls"]
 settings_tab = 0  # which settings tab the page shows
 
 
@@ -634,6 +763,78 @@ def sound_settings():
     return parts
 
 
+def all_apps():
+    apps = dict(settings["known_apps"])
+    for n in notes:
+        apps.setdefault(n["aumid"], n["app"])
+    for aumid in list(settings["mute_until"]) + list(settings["app_sounds"]) + list(settings["app_volumes"]) \
+            + list(settings["app_rings"]) + list(settings["app_ring_volumes"]) + list(settings["calls_muted"]):
+        apps.setdefault(aumid, wn.app_name(aumid, feed))
+    return apps
+
+
+def call_settings():
+    """Ringing for calls: the ringtone (an app's own, Windows' or your own
+    file), its volume, how long it rings, and each app's ringtone and volume."""
+    parts = [
+        fenn.toggle("ring_on", settings["ring_on"], label="Ring for incoming calls"),
+        fenn.row([
+            fenn.text("Ringtone", color="dim"),
+            fenn.button("ring_next", label=ring_name(settings["ringtone"]), icon="phone-call",
+                        tooltip="Click for the next ringtone"),
+            fenn.button("ring_test", icon="stop" if preview_until else "play",
+                        tooltip="Stop" if preview_until else "Play it"),
+        ], gap=8),
+        fenn.row([
+            fenn.text("Volume", color="dim"),
+            fenn.slider("ring_volume", settings["ring_volume"], min=0, max=100, step=5),
+        ], gap=8),
+        fenn.row([
+            fenn.text("Ring for", color="dim"),
+            fenn.chips("ring_seconds", ["20 s", "30 s", "45 s", "1 min"],
+                       RING_SECONDS.index(settings["ring_seconds"]) if settings["ring_seconds"] in RING_SECONDS else 2),
+        ], gap=8),
+        fenn.text("App\u2019s own: the ringtone the app uses (WhatsApp has its own; Phone Link uses Windows\u2019 call "
+                  "sound), or Windows\u2019 call sound for apps that have none. Drop an MP3, WAV or M4A file on this "
+                  "page to add your own ringtone. Calls show Accept, Decline and Mute in the bubble and the list.",
+                  size="small", color="faint", wrap=True),
+    ]
+    apps = all_apps()
+    if apps:
+        parts.append(fenn.text("Apps", size="small", color="dim", bold=True))
+        for aumid, name in sorted(apps.items(), key=lambda kv: kv[1].lower()):
+            key = settings["app_rings"].get(aumid, "default")
+            tip = "Ringtone for this app: click for the next one"
+            if app_ring_key(aumid) == "app":
+                path, where = wn.app_ringtone(aumid, None, cache)
+                tip += f"\nApp\u2019s own here: {os.path.basename(path or '') or 'none'} ({where})"
+            muted = aumid in settings["calls_muted"]
+            parts.append(fenn.row([
+                fenn.button(f"callmute:{aumid}", icon="phone-slash" if muted else "phone",
+                            tooltip="This app\u2019s calls are off (no bubble, no ringtone; they still go in the list) "
+                                    "\u00b7 click to turn them on" if muted
+                            else "Turn this app\u2019s calls off: no bubble and no ringtone. To keep the bubble "
+                                 "but ring quieter or not at all, use the volume slider instead."),
+                fenn.text(clip(name, 22), color="faint" if muted else "text"),
+                fenn.button(f"ringapp:{aumid}", label="Calls off" if muted else ring_name(key), icon="phone", tooltip=tip),
+                fenn.slider(f"ringvol:{aumid}", ring_volume(aumid), min=0, max=100, step=5, width=90,
+                            tooltip="Ringtone volume for this app"),
+                fenn.button(f"ringtest:{aumid}", icon="play", tooltip="Play this app\u2019s ringtone"),
+            ], gap=10))
+    return parts
+
+
+def preview_ring(key, aumid=None, volume=None):
+    global preview_until
+    path = ring_path(key, aumid or "", None) if key not in ("none", "default") else None
+    if path:
+        bubble.send(f"ring|{b64(path)}|{settings['ring_volume'] if volume is None else volume}|0")
+        preview_until = time.monotonic() + 7
+    else:
+        bubble.send("ringstop")
+        preview_until = 0.0
+
+
 def page_view():
     parts = []
     if notes:
@@ -653,8 +854,10 @@ def page_view():
         parts += bubble_settings()
     elif settings_tab == 1:
         parts += option_settings()
-    else:
+    elif settings_tab == 2:
         parts += sound_settings()
+    else:
+        parts += call_settings()
     return fenn.column(parts, gap=8, scroll=True)
 
 
@@ -681,6 +884,9 @@ def draw():
 # Incoming
 
 
+CALL_ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "call.png")  # green phone for calls
+
+
 def ingest(raw):
     aumid = raw["aumid"]
     info = wn.parse_toast(raw["payload"])
@@ -694,11 +900,20 @@ def ingest(raw):
     if aumid not in settings["known_apps"]:  # keep its settings row even after the history is cleared
         settings["known_apps"][aumid] = wn.app_name(aumid, feed)
         save_settings()
+    call = wn.is_call(info, raw["tag"], raw.get("group", ""))
+    if call:
+        # Any app's call: a green phone as the picture, the app's icon as its badge.
+        info["title"] = info["title"] or "Incoming call"
+        if not info["body"] or info["body"] == info["title"]:
+            info["body"] = "Incoming call"
+        image = CALL_ICON
+    else:
+        image = wn.sender_photo(aumid, info, cache) if settings["photos"] else wn.local_image(info["image"], cache)
     return {
         "order": raw["order"], "id": raw["id"], "aumid": aumid, "tag": raw["tag"],
         "app": wn.app_name(aumid, feed),
         "icon": wn.app_icon(aumid, cache, feed),
-        "image": wn.sender_photo(aumid, info, cache) if settings["photos"] else wn.local_image(info["image"], cache),
+        "image": image, "call": call,
         "info": info, "at": at, "unread": True,
     }
 
@@ -710,7 +925,7 @@ def poll():
     fresh = []
     for raw in feed.poll():
         note = ingest(raw)
-        if note and is_muted(note["aumid"]):
+        if note and (is_muted(note["aumid"]) or (note.get("call") and note["aumid"] in settings["calls_muted"])):
             note["unread"] = False  # no bubble, no sound, no marker
             note["quiet"] = True
         if note:
@@ -721,7 +936,10 @@ def poll():
         del notes[60:]
         badge_until = time.monotonic() + BADGE_HOLD
         quiet = not settings["fullscreen"] and fullscreen_app_running()
-        if not quiet:
+        calls = [n for n in fresh if n.get("call") and not n.get("quiet")]
+        if calls and not quiet:
+            start_ring(calls[-1])  # rings instead of the message sound
+        elif not quiet:
             loud = next((n for n in reversed(fresh) if not n.get("quiet") and sound_for(n)), None)
             if loud:
                 play(sound_for(loud), app_volume(loud["aumid"]))
@@ -747,13 +965,27 @@ def poll():
     if expire_mutes():
         draw()
 
+    # A call rings for a while, then its buttons go (it's still in the list).
+    global preview_until
+    for n in notes[:10]:
+        if n.get("ringing") and now - n.get("ring_at", now) > settings["ring_seconds"]:
+            end_ring(n)
+            draw()
+    if preview_until and now > preview_until:
+        preview_until = 0.0
+        if not any(n.get("ringing") and not n.get("silenced") for n in notes[:10]):
+            bubble.send("ringstop")
+        draw()
+
     # Toasts dismissed in Windows (or retracted by the app) leave here too.
     if now - last_check > 3:
         last_check = now
-        gone = [n for n in notes if n["unread"] and not feed.still_present(n["id"])]
+        gone = [n for n in notes if (n["unread"] or n.get("ringing")) and not feed.still_present(n["id"])]
         if gone:
             for n in gone:
                 n["unread"] = False
+                if n.get("ringing"):
+                    end_ring(n)  # answered or ended elsewhere
             if showing in gone:
                 bubble.send("hide")
             draw()
@@ -825,6 +1057,11 @@ def on_bubble(msg):
                 run_action(n, act, {inp["id"]: text})
             else:
                 app.log(f"{n['app']}: no send action for the reply box", "warn")
+    elif kind == "call":
+        oid, _, what = arg.partition("|")
+        n = find(oid)
+        if n and what in ("accept", "decline", "mute"):
+            call_action(n, what)
     elif kind == "mute":
         oid, _, mode = arg.partition("|")
         n = find(oid)
@@ -938,6 +1175,51 @@ def on_mute_windows_sounds(e):
     draw()
 
 
+@app.on("ring_on")
+def on_ring_on(e):
+    settings["ring_on"] = bool(e.get("value"))
+    save_settings()
+    draw()
+
+
+@app.on("ring_next")
+def on_ring_next(e):
+    keys = [k for k, _, _ in ring_library()]
+    i = keys.index(settings["ringtone"]) if settings["ringtone"] in keys else -1
+    settings["ringtone"] = keys[(i + 1) % len(keys)]
+    save_settings()
+    if settings["ringtone"] != "app":
+        preview_ring(settings["ringtone"])
+    draw()
+
+
+@app.on("ring_test")
+def on_ring_test(e):
+    global preview_until
+    if preview_until:
+        preview_until = 0.0
+        bubble.send("ringstop")
+    else:
+        key = settings["ringtone"]
+        sample = next((n["aumid"] for n in notes if n.get("call")), None) if key == "app" else None
+        preview_ring("w:ring01" if key == "app" and not sample else key, sample)
+    draw()
+
+
+@app.on("ring_volume")
+def on_ring_volume(e):
+    settings["ring_volume"] = int(e.get("value") or 0)
+    if e.get("kind") == "commit":
+        save_settings()
+
+
+@app.on("ring_seconds")
+def on_ring_seconds(e):
+    settings["ring_seconds"] = RING_SECONDS[e["value"]["index"]]
+    save_settings()
+    draw()
+
+
 @app.on_message("files")
 def on_files(msg):
     """Dropped sound files become choices; the last one is the new default."""
@@ -955,9 +1237,14 @@ def on_files(msg):
         settings["custom_sounds"].append({"name": name, "path": dst})
         added = "f:" + dst
     if added:
-        settings["sound"] = added
-        save_settings()
-        play(sound_path(added))
+        if settings_tab == 3:  # dropped on the Calls tab: the new ringtone
+            settings["ringtone"] = added
+            save_settings()
+            preview_ring(added)
+        else:
+            settings["sound"] = added
+            save_settings()
+            play(sound_path(added))
         draw()
 
 
@@ -1020,6 +1307,12 @@ def on_event(e):
         n = find(eid[2:])
         value = e.get("value") if isinstance(e.get("value"), dict) else e
         x = value.get("x") if isinstance(value, dict) else None
+        y = value.get("y") if isinstance(value, dict) else None
+        if n and n.get("ringing") and x is not None and (y is None or y >= 16):
+            hit = next((what for x0, x1, what, _, _ in call_pills(n, row_width) if x0 - 3 <= x <= x1 + 3), None)
+            if hit:
+                call_action(n, hit)
+                return
         convs = conversations()
         header = next(((l, g) for l, g in convs if l is n), None)
         if n and header and len(header[1]) > 1 and x is not None and x >= row_width - CHEVRON_W:
@@ -1047,6 +1340,46 @@ def on_event(e):
         save_settings()
         play(sound_path(nxt) if nxt not in ("default", "none") else
              sound_path(settings["sound"]) if nxt == "default" else None, app_volume(aumid))
+        draw()
+    elif eid.startswith("ringapp:"):
+        # Per-app ringtone: Default -> No ringtone -> each ringtone -> Default ...
+        aumid = eid[8:]
+        keys = ["default", "none"] + [k for k, _, _ in ring_library()]
+        cur = settings["app_rings"].get(aumid, "default")
+        nxt = keys[(keys.index(cur) + 1) % len(keys)] if cur in keys else "none"
+        if nxt == "default":
+            settings["app_rings"].pop(aumid, None)
+        else:
+            settings["app_rings"][aumid] = nxt
+        save_settings()
+        if nxt == "none":
+            bubble.send("ringstop")
+        else:
+            preview_ring(app_ring_key(aumid), aumid, ring_volume(aumid))
+        draw()
+    elif eid.startswith("callmute:"):
+        aumid = eid[9:]
+        if aumid in settings["calls_muted"]:
+            settings["calls_muted"].remove(aumid)
+        else:
+            settings["calls_muted"].append(aumid)
+            for n in notes[:10]:  # a call of that app ringing right now stops and goes away
+                if n["aumid"] == aumid and n.get("ringing"):
+                    end_ring(n)
+                    n["unread"] = False
+                    if showing is n:
+                        bubble.send("hide")
+        save_settings()
+        draw()
+    elif eid.startswith("ringvol:"):
+        aumid = eid[8:]
+        settings["app_ring_volumes"][aumid] = int(e.get("value") or 0)
+        if e.get("kind") == "commit":
+            save_settings()
+            preview_ring(app_ring_key(aumid), aumid, ring_volume(aumid))
+    elif eid.startswith("ringtest:"):
+        aumid = eid[9:]
+        preview_ring(app_ring_key(aumid), aumid, ring_volume(aumid))
         draw()
     elif eid.startswith("bell:"):
         aumid = eid[5:]
@@ -1137,6 +1470,28 @@ def seed_known_apps():
 
 seed_known_apps()
 app.every(30, draw)  # keeps "2m ago" labels fresh
+
+_stamps = {f: os.path.getmtime(os.path.join(HERE, f)) for f in os.listdir(HERE) if f.endswith((".py", ".ps1"))}
+
+
+def check_code():
+    """Restarts (Fenn starts the plugin again after it exits) when its code
+    changes, e.g. after a git pull, at most every 25 seconds. The bubble
+    window closes with it (run's finally) and opens again."""
+    for f, t in _stamps.items():
+        try:
+            if os.path.getmtime(os.path.join(HERE, f)) != t:
+                mark = os.path.join(app.data_dir, "reloaded")
+                if os.path.exists(mark) and time.time() - os.path.getmtime(mark) < 25:
+                    return
+                open(mark, "w").close()
+                app.stop()
+                return
+        except OSError:
+            pass
+
+
+app.every(2, check_code)
 poll()  # sets the starting point; old toasts are not replayed
 draw()
 try:

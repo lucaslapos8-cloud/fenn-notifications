@@ -73,7 +73,27 @@ reach the island either. Turn them back on (banners can stay off).
 
 - **Reading:** polls the Windows notification database
   (`%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db`) read-only,
-  a few times a second.
+  a few times a second. Toasts that fill in their text from data (Phone
+  Link's calls show `{contactName}` otherwise) get their values from the
+  same database's NotificationData table.
+- **Calls:** a call from any app (the toast's call scenario or ringtone,
+  accept / decline buttons, or words like "Incoming call") shows a green
+  phone as its picture with the app's icon on it, and **Accept**, **Decline**
+  and **Mute** right in the bubble (which stays out while it rings) and in the
+  list. Accept and Decline use the app's own buttons when its notification
+  has them (Phone Link does); otherwise Accept opens the call in the app and
+  Decline just stops the ringing here. Mute only silences the ringtone.
+- **Ringtones** (Settings > Calls, off until you switch on "Ring for incoming
+  calls"): the app's own ringtone (the sound its call notification names, a
+  ringtone in the app's install folder such as WhatsApp's, or one inside an
+  Electron app's `app.asar`), Windows' ringtones, or your own MP3/WAV/M4A
+  (drop it on the Calls tab), with a volume, how long to ring, and a ringtone
+  and volume per app. The bubble window plays it in a loop until you answer,
+  decline or mute, the call ends, or the time is up. The bubble's Mute silences
+  only that call; the next one rings again. To stop an app's calls for good,
+  click the phone button next to it: its calls no longer pop out or ring
+  (they still go into the list). To keep the bubble but ring quieter or not
+  at all, use that app's volume slider.
 - **Opening the right chat:** sends the notification's own launch data to the
   app the way Windows does. That is the app's toast activator found through its
   Start menu shortcut, a protocol link, or a packaged-app launch. It falls back
@@ -88,7 +108,12 @@ reach the island either. Turn them back on (banners can stay off).
 ## Privacy and network
 
 - Message text stays in memory only and is never written to disk. The data
-  folder (`FENN_DATA_DIR`) holds settings and cached app icons.
+  folder (`FENN_DATA_DIR`) holds settings, cached app icons and an empty
+  `reloaded` marker (the plugin restarts itself when its files change, at
+  most every 25 seconds).
+- To find an app's own ringtone the plugin looks through the app's install
+  folder (read-only); a ringtone inside an Electron app's `app.asar` is
+  copied into the cache.
 - The plugin makes only two kinds of network calls, both downloads that are
   cached in its data folder:
   - if a notification's picture is a web address (some apps send sender
@@ -128,6 +153,28 @@ Nook contributors). Color emoji are [Twemoji](https://github.com/jdecked/twemoji
 graphics (CC-BY 4.0, © Twitter, Inc. and other contributors), downloaded at runtime.
 
 ## Changelog
+
+**1.3.2**
+- Calls from any app show as calls: a green phone as the picture, the app's
+  icon on it, and the caller's name.
+- Accept, Decline and Mute for calls, in the bubble and in the list.
+- Ringtones for calls (Settings > Calls): each app's own ringtone, Windows'
+  ringtones or your own file, a volume, how long to ring, and per-app
+  ringtones and volumes.
+- Turn calls off per app (no bubble, no ringtone); Mute in a call's bubble
+  silences just that call.
+- Fixed: Phone Link calls showed `{contactName}` and `{incomingCallLabel}`
+  instead of the caller and "Incoming call".
+- Fixed: replying to WhatsApp (and other Store apps that send their own
+  notifications) only opened the app and dropped the text. The reply now
+  goes through the app's notification handler, as when you reply in
+  Windows' own notification (issue #2).
+- Apps that keep their extra actions in the notification's right-click menu
+  (WhatsApp: "Mute chat for 8 hours") get the first of them as a button in
+  the bubble. An item that would turn notifications off is never offered.
+- The reply box gets its own line in the bubble, with the buttons below it,
+  so it no longer gets squeezed by long button labels.
+- The plugin restarts itself after an update (e.g. `git pull`).
 
 **1.3.1**
 - Mute an app for 15 minutes, 1 hour or until you unmute: from the bubble's
