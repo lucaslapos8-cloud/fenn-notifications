@@ -15,6 +15,7 @@ HELPERS with the app's AppUserModelID.
 """
 
 import json
+import re
 import os
 import sqlite3
 import urllib.parse
@@ -26,7 +27,7 @@ def chat_link(note):
     """A link that opens the notification's chat, or None."""
     key = note["order"]
     if key not in _cache:
-        helper = HELPERS.get(note["aumid"].lower())
+        helper = HELPERS.get(note["aumid"].lower()) or FALLBACKS.get(note["aumid"].lower())
         if not helper:
             return None
         try:
@@ -98,6 +99,64 @@ def beeper(note):
         db.close()
 
 
+# ---------------------------------------------------------------------------
+# Discord: its notifications carry no chat at all, and it deletes a DM's
+# notification from Windows after about 2.5 seconds (server messages stay,
+# and those open through Windows' notification center). For a DM that's
+# gone, the next best is the Direct Messages list, newest DM on top.
+# Server notifications are titled "Name (#channel, Server)".
+
+DISCORD_SERVER = re.compile(r"\(#[^,()]+, .+\)\s*$")
+# Invisible direction marks Discord puts around names ("(⁨#channel⁩, ...").
+BIDI = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def discord(note):
+    title = BIDI.sub("", note["info"]["title"] or "").strip()
+    if not title or DISCORD_SERVER.search(title):
+        return None  # a server message: the notification center opens its channel
+    return "discord://-/channels/@me"
+
+
+DISCORD_CHANNEL = re.compile(r"\(#([^,()]+), (.+)\)\s*$")
+
+
+def discord_target(note):
+    """What to type into Discord's quick switcher: a DM's name (the sender),
+    or "#channel" with the server the result must be in."""
+    title = BIDI.sub("", note["info"]["title"] or "").strip()
+    if not title:
+        return None
+    m = DISCORD_CHANNEL.search(title)
+    if m:
+        return "#" + m.group(1).strip(), m.group(2).strip()
+    return title, ""
+
+
+def switch_target(note):
+    """(text to type, text the chosen result must also contain) for the app's
+    quick switcher, or None (option "quick_switch": the plugin presses the
+    app's shortcut, types the text and presses Enter only once it's sure the
+    switcher has it and the highlighted result is that chat; see
+    QuickSwitcher in bubble.ps1)."""
+    fn = SWITCHERS.get(note["aumid"].lower())
+    try:
+        return fn(note) if fn else None
+    except Exception:
+        return None
+
+
+# Helpers that open the exact chat: used first, every time.
 HELPERS = {
     "com.automattic.beeper.desktop": beeper,
+}
+# Helpers that only get close (a list the chat is in): used when Windows'
+# notification center can't open the exact chat any more.
+FALLBACKS = {
+    "com.squirrel.discord.discord": discord,
+}
+# Apps whose chats open through a quick switcher (Ctrl+K, name, Enter),
+# before the fallbacks above, when that option is on.
+SWITCHERS = {
+    "com.squirrel.discord.discord": discord_target,
 }

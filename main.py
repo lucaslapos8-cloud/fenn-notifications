@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 
 import deeplinks
 import fenn
@@ -48,6 +49,11 @@ DEFAULTS = {"popup": True, "seconds": 6, "hide_banners": False,
             # and each app's own ringtone and volume.
             "ring_on": False, "ringtone": "app", "ring_volume": 80, "ring_seconds": 45,
             "app_rings": {}, "app_ring_volumes": {},
+            "click_kinds": {},  # app -> how a click on its notification opens the chat (Apps tab)
+            "chat_apps": [],  # apps whose notifications had a reply box (the Apps tab lists chat apps)
+            "apps_show_all": False,  # the Apps tab: every app, not just chat apps
+            "nc_click": True,  # open exact chats by clicking the notification in Windows' notification center
+            "quick_switch": False,  # open Discord DMs through Discord's quick switcher (Ctrl+K, name, Enter)
             "calls_muted": []}  # apps whose calls are off: no bubble, no ringtone (still in the history)
 settings = {**DEFAULTS, **(app.load("settings", {}) or {})}
 for _a in settings.get("muted", []):
@@ -656,7 +662,7 @@ def header_row(latest, group, last, many, open_):
     ], gap=10)
 
 
-TAB_NAMES = ["Bubble", "Options", "Sounds", "Calls"]
+TAB_NAMES = ["Bubble", "Options", "Sounds", "Calls", "Apps"]
 settings_tab = 0  # which settings tab the page shows
 
 
@@ -702,12 +708,33 @@ def option_settings():
         fenn.toggle("color_emoji", settings["color_emoji"],
                     label="Color emoji in the bubble (Twemoji pictures, downloaded once each)"),
         fenn.toggle("fullscreen", settings["fullscreen"], label="Also pop out over full-screen apps and games"),
+        fenn.toggle("nc_click", settings["nc_click"],
+                    label="Open the exact chat through Windows’ notification center"),
+        fenn.text("For apps whose notifications don’t say which chat they’re from (Discord, …): a click "
+                  "opens Windows’ notification center for a moment and clicks the notification there, like you "
+                  "would. Works while Windows still has the notification.",
+                  size="small", color="faint", wrap=True),
+        fenn.toggle("quick_switch", settings["quick_switch"],
+                    label="Open Discord chats through Discord\u2019s quick switcher"),
+        fenn.text("For Discord messages Windows no longer has (DMs after a few seconds, server messages "
+                  "once clicked): a click opens Discord, presses Ctrl+K, types the sender\u2019s name or the "
+                  "#channel and opens it. It presses Enter only when the switcher holds exactly that text and "
+                  "the highlighted result is that chat (for a channel: that exact channel name); otherwise it "
+                  "stops. "
+                  "Off: the Direct Messages list for DMs, Discord for server messages.",
+                  size="small", color="faint", wrap=True),
         fenn.toggle("hide_banners", settings["hide_banners"],
                     label="Hide Windows banners (show them only here)"),
         fenn.text("Turns off \u201cShow notification banners\u201d for each app in Windows; they still go to "
                   "the notification center. Switching this off puts the banners back. If an app keeps "
                   "showing banners, sign out and in once, or turn on Do not disturb.",
                   size="small", color="faint", wrap=True),
+        fenn.row([
+            fenn.button("report_bug", label="Report a bug", icon="bug",
+                        tooltip="Opens a new GitHub issue with the plugin and Windows version filled in"),
+            fenn.button("open_readme", label="Help", icon="question",
+                        tooltip="The plugin\u2019s guide on GitHub: features, app notes, limits"),
+        ], gap=8),
     ]
 
 
@@ -825,6 +852,140 @@ def call_settings():
     return parts
 
 
+REPO = "https://github.com/lucaslapos8-cloud/fenn-notifications"
+CLICK_KINDS = {
+    # kind: (icon, color, what a click does, needs a helper)
+    "link": ("check-circle", "green", "Opens the exact chat, every time (through the app’s chat link)", False),
+    "data": ("check-circle", "green", "Opens the exact chat, every time (the notification says which)", False),
+    "once": ("warning-circle", "yellow", "Exact chat on the first click; after that a notification of the same "
+                                         "chat the app still remembers, or just the app", True),
+    "app": ("info", "orange", "Opens the app (its notifications don’t say which chat they’re from)", True),
+}
+
+
+def click_kind(aumid, info):
+    """How a click on this app's notifications opens the chat:
+    link = a helper in deeplinks.py knows the chat's link, data = the
+    notification carries the chat (most apps), once = the app forgets a
+    notification after one click (Electron), app = no chat in it at all."""
+    if aumid.lower() in deeplinks.HELPERS:
+        return "link"
+    probe = {"info": info}
+    if not info["launch"] and any("tag=" in a["arguments"] for a in info["actions"]):
+        return "once"
+    if info["launch"] or wn.click_arguments(probe):
+        return "data"
+    return "app"
+
+
+def plugin_version():
+    try:
+        with open(os.path.join(HERE, "plugin.toml"), encoding="utf-8") as f:
+            m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M)
+        return m.group(1) if m else "?"
+    except OSError:
+        return "?"
+
+
+def support_url(aumid, name, kind):
+    """A new GitHub issue with the app filled in (no message, sender or
+    other personal data: only the app's name and id)."""
+    title = f"Support request: open the right chat in {name}"
+    body = "\n".join([
+        f"**App:** {name}",
+        f"**App id (AppUserModelID):** `{aumid}`",
+        f"**How clicks work now:** {CLICK_KINDS.get(kind, ('', '', 'not known yet'))[2]}",
+        f"**Plugin version:** {plugin_version()}",
+        "",
+        "**Can you help?** (fill in what you know)",
+        "- Does the app have a “Copy link” option for a chat or conversation? "
+        "What does such a link look like? (replace names and numbers with xxx)",
+        "- Anything else about how the app opens chats:",
+    ])
+    return f"{REPO}/issues/new?title={urllib.parse.quote(title)}&body={urllib.parse.quote(body)}"
+
+
+# Chat apps whose notifications may have no reply box (matched in the app's
+# id or name). Others count as chat apps once a notification has one.
+KNOWN_CHAT = re.compile(r"whatsapp|telegram|discord|signal|slack|teams|messenger|beeper|viber|\belement\b"
+                        r"|yourphone|phone link|skype", re.I)
+
+
+def learn_app(aumid, info):
+    """Remembers how the app's clicks work and whether it's a chat app (its
+    notification has a reply box). True when something changed."""
+    changed = False
+    kind = click_kind(aumid, info)
+    if settings["click_kinds"].get(aumid) != kind:
+        settings["click_kinds"][aumid] = kind
+        changed = True
+    if aumid not in settings["chat_apps"] and any(i["type"] == "text" for i in info["inputs"]):
+        settings["chat_apps"].append(aumid)
+        changed = True
+    return changed
+
+
+def is_chat_app(aumid, name):
+    return aumid in settings["chat_apps"] or bool(KNOWN_CHAT.search(f"{aumid} {name}"))
+
+
+def bug_url():
+    """A new GitHub issue with the versions filled in (nothing personal)."""
+    import platform
+    body = "\n".join([
+        f"**Plugin version:** {plugin_version()}",
+        f"**Windows:** {platform.platform()}",
+        "",
+        "**What happened?**",
+        "",
+        "**What did you expect?**",
+        "",
+        "**Which app's notifications?** (e.g. WhatsApp, Discord)",
+        "",
+        "**Steps to make it happen again:**",
+        "1. ",
+        "",
+        "<!-- Fenn's log is %APPDATA%\\Fenn\\fenn.log. Lines with [plugin:notifications] can help, "
+        "but check them for names or message text before you paste them. -->",
+    ])
+    return f"{REPO}/issues/new?title={urllib.parse.quote('Bug: ')}&body={urllib.parse.quote(body)}"
+
+
+def app_settings():
+    """The chat apps that have sent notifications (or, switched on, every
+    app), and how a click on them opens the chat, with a link to ask for a
+    helper where it can't be exact."""
+    parts = [fenn.text("How clicking a message opens the chat it came from, for each chat app. Apps marked "
+                       "yellow or orange can get exact chats through a helper: Request support opens a "
+                       "GitHub issue with the app’s name filled in (nothing else is sent).",
+                       size="small", color="faint", wrap=True)]
+    every = all_apps()
+    if settings["apps_show_all"]:
+        apps = every
+    else:  # chat apps that have sent at least one notification
+        apps = {a: n for a, n in every.items() if a in settings["click_kinds"] and is_chat_app(a, n)}
+    if not apps:
+        parts.append(fenn.text("Chat apps show up here after their first message.", size="small", color="faint",
+                               wrap=True))
+    for aumid, name in sorted(apps.items(), key=lambda kv: kv[1].lower()):
+        kind = "link" if aumid.lower() in deeplinks.HELPERS else settings["click_kinds"].get(aumid)
+        icon, color, what, ask = CLICK_KINDS.get(kind, ("question", "faint", "Not known yet: shows after its next "
+                                                                          "notification", False))
+        if kind == "app" and settings["nc_click"]:
+            icon, color = "warning-circle", "yellow"
+            what = ("Exact chat through Windows’ notification center while Windows still has the "
+                    "notification; after that, " + ("the list the chat is in (e.g. Direct Messages)"
+                                                    if aumid.lower() in deeplinks.FALLBACKS else "just the app"))
+        head = [fenn.icon(icon, color=color), fenn.text(clip(name, 28), bold=True), fenn.spacer()]
+        if ask:
+            head.append(fenn.button(f"support:{aumid}", label="Request support", icon="github-logo",
+                                    tooltip="Opens a GitHub issue asking for a helper for this app"))
+        parts.append(fenn.row(head, gap=8))
+        parts.append(fenn.text(what, size="small", color="dim", wrap=True))
+    parts.append(fenn.toggle("apps_show_all", settings["apps_show_all"], label="Show all apps, not just chat apps"))
+    return parts
+
+
 def preview_ring(key, aumid=None, volume=None):
     global preview_until
     path = ring_path(key, aumid or "", None) if key not in ("none", "default") else None
@@ -857,8 +1018,10 @@ def page_view():
         parts += option_settings()
     elif settings_tab == 2:
         parts += sound_settings()
-    else:
+    elif settings_tab == 3:
         parts += call_settings()
+    else:
+        parts += app_settings()
     return fenn.column(parts, gap=8, scroll=True)
 
 
@@ -901,6 +1064,7 @@ def ingest(raw):
     if aumid not in settings["known_apps"]:  # keep its settings row even after the history is cleared
         settings["known_apps"][aumid] = wn.app_name(aumid, feed)
         save_settings()
+    learn_app(aumid, info) and save_settings()
     call = wn.is_call(info, raw["tag"], raw.get("group", ""))
     if call:
         # Any app's call: a green phone as the picture, the app's icon as its badge.
@@ -1018,29 +1182,79 @@ def open_note(n):
     """Opens the chat a notification came from, however old it is and
     however often it was clicked:
     1. A direct link to the chat when the app has one (deeplinks.py).
-    2. Otherwise the notification's own click, which most apps understand
+    2. Apps whose notifications don't say which chat (Discord, ...), or
+       that have forgotten an already-clicked one: the notification is
+       clicked in Windows' notification center, like a user would, while
+       Windows still has it (option "nc_click").
+    3. Otherwise the notification's own click, which most apps understand
        every time (it says which chat it is).
-    3. For apps that forget a notification after one click: a notification
+    4. For apps that forget a notification after one click: a notification
        of the same chat they still remember, or else just the app."""
     n["unread"] = False
-    link = deeplinks.chat_link(n)
-    if link:
-        app.log(f"{n['app']}: opening the chat through its link")
-        wn.activate(n["aumid"], link, "protocol", log=app.log, check=True)
+    exact = n["aumid"].lower() in deeplinks.HELPERS
+    if not exact and settings["nc_click"] and needs_center(n) and feed.still_present(n["id"]):
+        app.log(f"{n['app']}: clicking it in the notification center")
+        nc_pending[str(n["order"])] = n
+        info = n["info"]
+        bubble.send("|".join(["ncclick", str(n["order"]), b64(n["app"]), b64(info["title"]), b64(info["body"])]))
     else:
-        target = n
-        if one_shot(n) and (n.get("clicked") or not feed.still_present(n["id"])):
-            key = conv_key(n)
-            target = next((x for x in notes if conv_key(x) == key and not x.get("clicked")
-                           and feed.still_present(x["id"])), None)
-        if target is not None:
-            target["clicked"] = True
-            wn.activate(target["aumid"], wn.click_arguments(target), target["info"]["activation"], log=app.log,
-                        check=True)
-        else:
-            wn.activate(n["aumid"], "", "foreground", log=app.log, launch_only=True)
+        open_link_or_direct(n)
     n["clicked"] = True
     draw()
+
+
+qs_pending = {}  # notification order -> note waiting for the quick switcher's answer
+
+
+def open_link_or_direct(n, switch=True):
+    """The app's quick switcher (option), the app's chat link (exact, or for
+    some apps the list the chat is in), else the notification's own click."""
+    target = deeplinks.switch_target(n) if switch and settings["quick_switch"] else None
+    if target:
+        name, within = target
+        def go():
+            folder = wn.app_folder(n["aumid"])
+            hwnd = wn.main_window(folder) if folder else None
+            if not hwnd:  # not running: its link starts it
+                open_link_or_direct(n, switch=False)
+                return
+            wn.raise_window(hwnd)
+            app.log(f"{n['app']}: opening the chat through its quick switcher")
+            qs_pending[str(n["order"])] = n
+            bubble.send("|".join(["qswitch", str(n["order"]), str(hwnd), b64(name), b64(within)]))
+        threading.Thread(target=go, daemon=True).start()
+        return
+    link = deeplinks.chat_link(n)
+    if link:
+        app.log(f"{n['app']}: opening it through the app’s link")
+        wn.activate(n["aumid"], link, "protocol", log=app.log, check=True)
+    else:
+        open_direct(n)
+
+
+nc_pending = {}  # notification order -> note waiting for the notification center's answer
+
+
+def needs_center(n):
+    """The plugin's own click can't reach the exact chat: the notification
+    carries nothing to say which (Discord), or the app forgets one once
+    clicked and this one was."""
+    kind = click_kind(n["aumid"], n["info"])
+    return kind == "app" or (kind == "once" and bool(n.get("clicked")))
+
+
+def open_direct(n):
+    target = n
+    if one_shot(n) and (n.get("clicked") or not feed.still_present(n["id"])):
+        key = conv_key(n)
+        target = next((x for x in notes if conv_key(x) == key and not x.get("clicked")
+                       and feed.still_present(x["id"])), None)
+    if target is not None:
+        target["clicked"] = True
+        wn.activate(target["aumid"], wn.click_arguments(target), target["info"]["activation"], log=app.log,
+                    check=True)
+    else:
+        wn.activate(n["aumid"], "", "foreground", log=app.log, launch_only=True)
 
 
 @app.on_message("bubble")
@@ -1051,6 +1265,24 @@ def on_bubble(msg):
         n = find(arg)
         if n:
             open_note(n)
+    elif kind == "qswitch":
+        oid, _, result = arg.partition("|")
+        n = qs_pending.pop(oid, None)
+        if n is not None and result == "ok":
+            app.log(f"{n['app']}: opened the chat through its quick switcher")
+        elif n is not None:
+            app.log(f"{n['app']}: quick switcher stopped ({result.partition('|')[2] or 'no reason'}), "
+                    "using its link instead")
+            open_link_or_direct(n, switch=False)
+    elif kind == "ncclick":
+        oid, _, result = arg.partition("|")
+        n = nc_pending.pop(oid, None)
+        if n is not None and result == "ok":
+            app.log(f"{n['app']}: clicked it in the notification center")
+        elif n is not None:
+            app.log(f"{n['app']}: not clicked in the notification center ({result.partition('|')[2] or 'no reason'}), "
+                    "opening it directly")
+            open_link_or_direct(n)
     elif kind == "dismiss":
         n = find(arg)
         if n:
@@ -1289,6 +1521,27 @@ def on_fullscreen(e):
     draw()
 
 
+@app.on("nc_click")
+def on_nc_click(e):
+    settings["nc_click"] = bool(e.get("value"))
+    save_settings()
+    draw()
+
+
+@app.on("quick_switch")
+def on_quick_switch(e):
+    settings["quick_switch"] = bool(e.get("value"))
+    save_settings()
+    draw()
+
+
+@app.on("apps_show_all")
+def on_apps_show_all(e):
+    settings["apps_show_all"] = bool(e.get("value"))
+    save_settings()
+    draw()
+
+
 @app.on("seconds")
 def on_seconds(e):
     settings["seconds"] = DURATIONS[e["value"]["index"]]
@@ -1376,6 +1629,14 @@ def on_event(e):
         else:
             preview_ring(app_ring_key(aumid), aumid, ring_volume(aumid))
         draw()
+    elif eid == "report_bug":
+        app.open(bug_url())
+    elif eid == "open_readme":
+        app.open(REPO + "#readme")
+    elif eid.startswith("support:"):
+        aumid = eid[8:]
+        name = all_apps().get(aumid) or wn.app_name(aumid, feed)
+        app.open(support_url(aumid, name, settings["click_kinds"].get(aumid)))
     elif eid.startswith("callmute:"):
         aumid = eid[9:]
         if aumid in settings["calls_muted"]:
@@ -1487,7 +1748,29 @@ def seed_known_apps():
         save_settings()
 
 
+def seed_click_kinds():
+    """Learn how each app's clicks work (the Apps tab) from the notifications
+    Windows still has, instead of waiting for each app's next one."""
+    try:
+        rows = feed._connect().execute(
+            "select h.PrimaryId, n.Payload from Notification n join NotificationHandler h "
+            "on n.HandlerId = h.RecordId where n.Type = 'toast' and n.Payload is not null "
+            "order by n.ArrivalTime").fetchall()
+    except Exception:
+        return
+    changed = False
+    for aumid, payload in rows:  # oldest first: the newest of each app wins
+        try:
+            info = wn.parse_toast(payload.decode("utf-8", "replace") if isinstance(payload, bytes) else payload)
+        except Exception:
+            continue
+        changed = learn_app(aumid, info) or changed
+    if changed:
+        save_settings()
+
+
 seed_known_apps()
+seed_click_kinds()
 app.every(30, draw)  # keeps "2m ago" labels fresh
 
 _stamps = {f: os.path.getmtime(os.path.join(HERE, f)) for f in os.listdir(HERE) if f.endswith((".py", ".ps1"))}

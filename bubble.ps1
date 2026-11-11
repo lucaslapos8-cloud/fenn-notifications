@@ -14,11 +14,15 @@
 #   emoji|<0/1>|b64 cache folder
 #   layout|<left|center|right>|<primary|secondary|cursor>|<margin>|<pill|notch>|<autohide 0/1>
 #   hide
+#   ncclick|id|b64 app|b64 title|b64 body   (click that notification in Windows' notification center)
+#   qswitch|id|hwnd|b64 name|b64 within   (open a chat through the app's quick switcher: Ctrl+K, name,
+#                                          the result that also names "within" (a server), Enter)
 # and it answers on stdout: ready, click|id, dismiss|id, hidden|id,
-# reply|id|b64 text, action|id|index, mute|id|<15|60|forever|off>, call|id|<accept|decline|mute>
+# reply|id|b64 text, action|id|index, mute|id|<15|60|forever|off>, call|id|<accept|decline|mute>,
+# ncclick|id|<ok|miss|reason>, qswitch|id|<ok|miss|reason>
 
 $ErrorActionPreference = 'Stop'
-Add-Type -ReferencedAssemblies PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Drawing -TypeDefinition @'
+Add-Type -ReferencedAssemblies PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Drawing, UIAutomationClient, UIAutomationTypes -TypeDefinition @'
 using System;
 using System.IO;
 using System.Text;
@@ -37,6 +41,419 @@ using System.Windows.Shapes;
 using System.Windows.Threading;
 
 namespace FennNotify {
+
+// Clicks a notification in Windows' notification center, exactly like a user
+// would: for apps whose notifications don't say which chat they belong to
+// (Discord, ...), only Windows' own click reaches the running app's handler
+// that knows the chat. The center has to be open for its list to exist, so
+// it is opened with Win+N, the notification is invoked (which closes it),
+// and it is closed again if nothing matched.
+public static class NotificationCenter {
+    [DllImport("user32.dll")] static extern void keybd_event(byte v, byte s, uint f, UIntPtr e);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int a, out int v, int size);
+    static int busy;
+    [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
+
+    public static void Click(string id, string app, string title, string body) {
+        var t = new Thread(() => {
+            // Physical pixels for both the notification's position and the cursor.
+            try { SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch { }  // per-monitor aware v2
+            bool ok = false;
+            why = "busy";
+            if (Interlocked.Exchange(ref busy, 1) == 0) {
+                try { ok = Run(app, title, body); } catch (Exception e) { ok = false; why = "error " + e.GetType().Name; }
+                busy = 0;
+            }
+            Bubble.Say("ncclick|" + id + "|" + (ok ? "ok" : "miss|" + why));
+        });
+        t.IsBackground = true;
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+    }
+
+    static uint shellPid;
+    static string why = "";
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+
+    // Windows.UI.Core.CoreWindow windows of ShellExperienceHost (the center is one of them).
+    // EnumWindows skips the shell's own layer of windows; FindWindowEx doesn't.
+    static System.Collections.Generic.List<IntPtr> ShellWindows() {
+        var list = new System.Collections.Generic.List<IntPtr>();
+        IntPtr h = IntPtr.Zero;
+        while ((h = FindWindowEx(IntPtr.Zero, h, "Windows.UI.Core.CoreWindow", null)) != IntPtr.Zero) {
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            try {
+                if (string.Equals(System.Diagnostics.Process.GetProcessById((int)pid).ProcessName, "ShellExperienceHost",
+                                  StringComparison.OrdinalIgnoreCase)) { list.Add(h); shellPid = pid; }
+            } catch { }
+        }
+        return list;
+    }
+
+    static bool Shown(IntPtr h) {
+        int cloaked;
+        return DwmGetWindowAttribute(h, 14, out cloaked, 4) != 0 || cloaked == 0;  // DWMWA_CLOAKED
+    }
+
+    static System.Windows.Automation.AutomationElement OpenList() {
+        foreach (var h in ShellWindows()) {
+            if (!Shown(h)) continue;
+            try {
+                var w = System.Windows.Automation.AutomationElement.FromHandle(h);
+                var l = w.FindFirst(System.Windows.Automation.TreeScope.Descendants,
+                    new System.Windows.Automation.PropertyCondition(
+                        System.Windows.Automation.AutomationElement.AutomationIdProperty, "MainListView"));
+                if (l != null) return l;
+            } catch { }
+        }
+        return null;
+    }
+
+    static void Key(params byte[] keys) {
+        foreach (var k in keys) keybd_event(k, 0, 0, UIntPtr.Zero);
+        for (int i = keys.Length - 1; i >= 0; i--) keybd_event(keys[i], 0, 2, UIntPtr.Zero);
+    }
+
+    // Esc only while the center itself is in front, so no other app gets it.
+    static void Close() {
+        var fg = GetForegroundWindow();
+        uint pid; GetWindowThreadProcessId(fg, out pid);
+        if (shellPid != 0 && pid == shellPid) Key(0x1B);
+    }
+
+    static string Norm(string s) {
+        // Discord wraps names in invisible direction marks; they don't count.
+        s = System.Text.RegularExpressions.Regex.Replace(s ?? "", "[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "");
+        return System.Text.RegularExpressions.Regex.Replace(s, @"\s+", " ").Trim();
+    }
+
+    static string Child(System.Windows.Automation.AutomationElement e, string aid) {
+        var c = e.FindFirst(System.Windows.Automation.TreeScope.Children,
+            new System.Windows.Automation.PropertyCondition(System.Windows.Automation.AutomationElement.AutomationIdProperty, aid));
+        return c == null ? "" : Norm(c.Current.Name);
+    }
+
+    static System.Windows.Automation.AutomationElementCollection Items(System.Windows.Automation.AutomationElement under) {
+        return under.FindAll(System.Windows.Automation.TreeScope.Descendants,
+            new System.Windows.Automation.PropertyCondition(System.Windows.Automation.AutomationElement.ControlTypeProperty,
+                System.Windows.Automation.ControlType.ListItem));
+    }
+
+    static System.Windows.Automation.AutomationElement Best(System.Windows.Automation.AutomationElementCollection items,
+                                                           string title, string body) {
+        System.Windows.Automation.AutomationElement best = null;
+        int bestScore = 0;
+        foreach (System.Windows.Automation.AutomationElement it in items) {
+            string t = Child(it, "Title"), c = Child(it, "Content");
+            if (t != title && !(t.Length > 0 && title.StartsWith(t)) && !(title.Length > 0 && t.StartsWith(title))) continue;
+            int score = t == title ? 2 : 1;
+            if (body.Length == 0) score += 1;
+            else if (c == body) score += 3;
+            else if (c.Length > 0 && (body.StartsWith(c.TrimEnd('.', (char)0x2026)) || c.StartsWith(body) || c.Contains(body))) score += 2;
+            else continue;
+            if (score > bestScore) { best = it; bestScore = score; }  // the list is newest first
+        }
+        return best;
+    }
+
+    static bool Run(string app, string title, string body) {
+        title = Norm(title); body = Norm(body);
+        var list = OpenList();
+        bool opened = false;
+        if (list == null) {
+            Key(0x5B, 0x4E);  // Win+N
+            opened = true;
+            var until = DateTime.Now.AddMilliseconds(2500);
+            while (list == null && DateTime.Now < until) { Thread.Sleep(60); list = OpenList(); }
+            if (list == null) { why = "the notification center didn't open"; return false; }
+        }
+        // The list fills in a moment after the center opens.
+        var filled = DateTime.Now.AddMilliseconds(1500);
+        while (Items(list).Count == 0 && DateTime.Now < filled) Thread.Sleep(60);
+        Thread.Sleep(120);
+        // The app's group: expand "+N notifications" so older ones are in the list too.
+        System.Windows.Automation.AutomationElement scope = list;
+        foreach (System.Windows.Automation.AutomationElement g in list.FindAll(System.Windows.Automation.TreeScope.Children,
+                     new System.Windows.Automation.PropertyCondition(System.Windows.Automation.AutomationElement.ControlTypeProperty,
+                         System.Windows.Automation.ControlType.Group))) {
+            if (!string.Equals(Child(g, "Title"), Norm(app), StringComparison.OrdinalIgnoreCase)) continue;
+            scope = g;
+            var more = g.FindFirst(System.Windows.Automation.TreeScope.Descendants,
+                new System.Windows.Automation.PropertyCondition(System.Windows.Automation.AutomationElement.AutomationIdProperty, "SeeMoreLessButton"));
+            if (Best(Items(g), title, body) == null && more != null && Items(g).Count <= 1) {
+                try { ((System.Windows.Automation.InvokePattern)more.GetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern)).Invoke(); } catch { }
+                Thread.Sleep(350);
+            }
+            break;
+        }
+        var hit = Best(Items(scope), title, body) ?? Best(Items(list), title, body);
+        if (hit == null) {
+            why = "no match among " + Items(list).Count + " notifications (" + (scope == list ? "no" : "found the") + " app group)";
+            if (opened) Close();
+            return false;
+        }
+        // A real click on it: the center's own Invoke only selects a notification.
+        object scroll;
+        if (hit.TryGetCurrentPattern(System.Windows.Automation.ScrollItemPattern.Pattern, out scroll)) {
+            try { ((System.Windows.Automation.ScrollItemPattern)scroll).ScrollIntoView(); Thread.Sleep(150); } catch { }
+        }
+        var r = hit.Current.BoundingRectangle;
+        if (r.IsEmpty || r.Width < 20 || r.Height < 20) {
+            why = "it isn't on screen";
+            if (opened) Close();
+            return false;
+        }
+        POINT old; GetCursorPos(out old);
+        // Left part of the card, off its buttons (expand, settings, close sit on the right).
+        int cx = (int)(r.Left + Math.Min(60, r.Width / 3)), cy = (int)(r.Top + r.Height / 2);
+        SetCursorPos(cx, cy);
+        Thread.Sleep(40);
+        mouse_event(2, 0, 0, 0, UIntPtr.Zero);  // left down
+        mouse_event(4, 0, 0, 0, UIntPtr.Zero);  // left up
+        Thread.Sleep(60);
+        SetCursorPos(old.X, old.Y);
+        Thread.Sleep(400);
+        if (OpenList() != null) Close();  // usually it closes itself
+        return true;
+    }
+}
+
+// Opens a chat through an app's quick switcher (Discord: Ctrl+K, the name,
+// Enter), for chats nothing else can reach. It types only after checking
+// that the switcher has focus (a combo box inside a dialog of the app's own
+// window), and presses Enter only once that box holds exactly the name, so
+// the name can never end up in a message box. Any failed check: Esc (only
+// while the switcher has focus) and a miss.
+public static class QuickSwitcher {
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern void keybd_event(byte v, byte s, uint f, UIntPtr e);
+    [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] inputs, int size);
+    [StructLayout(LayoutKind.Sequential)] struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public IntPtr extra; }
+    [StructLayout(LayoutKind.Sequential)] struct MOUSEINPUT { public int dx, dy; public uint data, flags, time; public IntPtr extra; }
+    [StructLayout(LayoutKind.Explicit)] struct UNION { [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] public MOUSEINPUT mi; }
+    [StructLayout(LayoutKind.Sequential)] struct INPUT { public uint type; public UNION u; }
+    static int busy;
+    static string why = "";
+
+    public static void Open(string id, string hwnd, string name, string within) {
+        var t = new Thread(() => {
+            bool ok = false;
+            why = "busy";
+            if (Interlocked.Exchange(ref busy, 1) == 0) {
+                try { long h; ok = long.TryParse(hwnd, out h) && Run(new IntPtr(h), name, within); }
+                catch (Exception e) { ok = false; why = "error " + e.GetType().Name; }
+                busy = 0;
+            }
+            Bubble.Say("qswitch|" + id + "|" + (ok ? "ok" : "miss|" + why));
+        });
+        t.IsBackground = true;
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+    }
+
+    static void Key(params byte[] keys) {
+        foreach (var k in keys) keybd_event(k, 0, 0, UIntPtr.Zero);
+        for (int i = keys.Length - 1; i >= 0; i--) keybd_event(keys[i], 0, 2, UIntPtr.Zero);
+    }
+
+    static void Type(string text) {
+        var list = new System.Collections.Generic.List<INPUT>();
+        foreach (char c in text) {
+            foreach (uint f in new uint[] { 4, 4 | 2 }) {  // KEYEVENTF_UNICODE, then with KEYUP
+                var i = new INPUT { type = 1 };
+                i.u.ki = new KEYBDINPUT { wScan = c, dwFlags = f };
+                list.Add(i);
+            }
+        }
+        SendInput((uint)list.Count, list.ToArray(), Marshal.SizeOf(typeof(INPUT)));
+    }
+
+    static string Norm(string s) {
+        s = System.Text.RegularExpressions.Regex.Replace(s ?? "", BIDI, "");
+        return System.Text.RegularExpressions.Regex.Replace(s, @"\s+", " ").Trim();
+    }
+
+    // The switcher: a combo box inside a dialog, in the app's own process.
+    static System.Windows.Automation.AutomationElement Switcher(uint pid) {
+        try { return SwitcherNow(pid); } catch { return null; }  // the page rebuilds elements as it opens
+    }
+
+    static System.Windows.Automation.AutomationElement SwitcherNow(uint pid) {
+        System.Windows.Automation.AutomationElement e;
+        try { e = System.Windows.Automation.AutomationElement.FocusedElement; } catch { return null; }
+        if (e == null || e.Current.ProcessId != (int)pid) return null;
+        if (e.Current.ControlType != System.Windows.Automation.ControlType.ComboBox) return null;
+        object v;
+        if (!e.TryGetCurrentPattern(System.Windows.Automation.ValuePattern.Pattern, out v)) return null;
+        var w = System.Windows.Automation.TreeWalker.ControlViewWalker;
+        var p = w.GetParent(e);
+        for (int i = 0; p != null && i < 6; i++, p = w.GetParent(p)) {
+            if (p.Current.ControlType == System.Windows.Automation.ControlType.Document) return null;  // reached the page
+            if (p.Current.ControlType == System.Windows.Automation.ControlType.Window) return e;  // a dialog
+        }
+        return null;
+    }
+
+    // The switcher's text box, found again each time (the page rebuilds it).
+    static string BoxText(uint pid) {
+        try {
+            var e = System.Windows.Automation.AutomationElement.FocusedElement;
+            if (e == null || e.Current.ProcessId != (int)pid) return null;
+            var w = System.Windows.Automation.TreeWalker.ControlViewWalker;
+            var p = e;
+            for (int i = 0; p != null && i < 10; i++, p = w.GetParent(p)) {
+                if (p.Current.ControlType == System.Windows.Automation.ControlType.Document) return null;
+                if (p.Current.ControlType == System.Windows.Automation.ControlType.Window) {
+                    var box = p.FindFirst(System.Windows.Automation.TreeScope.Descendants,
+                        new System.Windows.Automation.PropertyCondition(System.Windows.Automation.AutomationElement.ControlTypeProperty,
+                            System.Windows.Automation.ControlType.ComboBox));
+                    return box == null ? null : Value(box);
+                }
+            }
+        } catch { }
+        return null;
+    }
+
+    static string Value(System.Windows.Automation.AutomationElement e) {
+        try { return ((System.Windows.Automation.ValuePattern)e.GetCurrentPattern(System.Windows.Automation.ValuePattern.Pattern)).Current.Value; }
+        catch { return null; }
+    }
+
+    // The highlighted result in the switcher's list (Discord moves focus to it).
+    static string Highlighted(uint pid) {
+        try {
+            var e = System.Windows.Automation.AutomationElement.FocusedElement;
+            if (e == null || e.Current.ProcessId != (int)pid) return "";
+            if (e.Current.ControlType == System.Windows.Automation.ControlType.ComboBox) return "";
+            return Norm(e.Current.Name);
+        } catch { return ""; }
+    }
+
+    // Esc until the switcher is gone (after arrow keys, Discord's first Esc
+    // only clears the text), only while the app is in front.
+    static void CloseSwitcher(uint pid, IntPtr hwnd) {
+        for (int i = 0; i < 3 && BoxText(pid) != null && GetForegroundWindow() == hwnd; i++) {
+            Key(0x1B);
+            Thread.Sleep(200);
+        }
+    }
+
+    // The texts of the switcher's results (the highlighted one's siblings).
+    static System.Collections.Generic.List<string> Results(uint pid) {
+        var list = new System.Collections.Generic.List<string>();
+        try {
+            var e = System.Windows.Automation.AutomationElement.FocusedElement;
+            if (e == null || e.Current.ProcessId != (int)pid) return list;
+            var parent = System.Windows.Automation.TreeWalker.ControlViewWalker.GetParent(e);
+            if (parent == null) return list;
+            foreach (System.Windows.Automation.AutomationElement it in parent.FindAll(System.Windows.Automation.TreeScope.Children,
+                         new System.Windows.Automation.PropertyCondition(System.Windows.Automation.AutomationElement.ControlTypeProperty,
+                             System.Windows.Automation.ControlType.ListItem)))
+                list.Add(Norm(it.Current.Name));
+        } catch { }
+        return list;
+    }
+
+    // Does a result's text name it? (a DM: the name; a channel: "channel, kind, server")
+    static bool Names(string result, string name, string within) {
+        string key = name.TrimStart('#');
+        if (result.IndexOf(key, StringComparison.OrdinalIgnoreCase) < 0) return false;
+        return within.Length == 0 || result.IndexOf(within, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    static bool Run(IntPtr hwnd, string name, string within) {
+        name = Norm(name);
+        within = Norm(within);
+        if (name.Length == 0) { why = "no name"; return false; }
+        var until = DateTime.Now.AddMilliseconds(900);
+        while (GetForegroundWindow() != hwnd && DateTime.Now < until) Thread.Sleep(30);
+        if (GetForegroundWindow() != hwnd) { why = "the app isn't in front"; return false; }
+        uint pid; GetWindowThreadProcessId(hwnd, out pid);
+        if (BoxText(pid) != null) { CloseSwitcher(pid, hwnd); Thread.Sleep(100); }  // one left open: Ctrl+K would close it
+        Key(0x11, 0x4B);  // Ctrl+K
+        until = DateTime.Now.AddMilliseconds(1500);
+        while (Switcher(pid) == null && DateTime.Now < until) Thread.Sleep(40);
+        if (Switcher(pid) == null) { why = "the quick switcher didn't open"; return false; }  // nothing typed
+        // It settles for a moment as it opens: check again right before typing.
+        Thread.Sleep(150);
+        if (Switcher(pid) == null || GetForegroundWindow() != hwnd) { why = "the quick switcher lost focus before typing"; return false; }
+        if (!string.IsNullOrEmpty(BoxText(pid))) { Key(0x11, 0x41); Thread.Sleep(30); }  // Ctrl+A: replace old text
+        Type(name);
+        until = DateTime.Now.AddMilliseconds(1000);
+        while (Norm(BoxText(pid)) != name && DateTime.Now < until) Thread.Sleep(30);
+        if (Norm(BoxText(pid)) != name) {
+            why = BoxText(pid) == null ? "the quick switcher closed while typing (nothing was sent)"
+                                       : "the name didn't land in the quick switcher";
+            CloseSwitcher(pid, hwnd);
+            return false;
+        }
+        // The highlighted result has to be that chat, or Enter would open
+        // something else. A DM: the result names it. A channel: exactly one
+        // result is a channel of that name (results read "channel, kind,
+        // server"); several: the one that also names "within", else stop.
+        string top = "";
+        until = DateTime.Now.AddMilliseconds(900);
+        while (DateTime.Now < until) {
+            Thread.Sleep(60);
+            top = Highlighted(pid);
+            if (top.Length > 0) break;
+        }
+        string want = null;
+        if (name.StartsWith("#")) {
+            string key = name.Substring(1).Trim();
+            var same = new System.Collections.Generic.List<string>();
+            foreach (var r in Results(pid)) {
+                string first = Norm(r.Split(',')[0]).TrimStart('#').Trim();
+                if (string.Equals(first, key, StringComparison.OrdinalIgnoreCase)) same.Add(r);
+            }
+            if (same.Count > 1 && within.Length > 0) {
+                var inside = same.FindAll(r => r.IndexOf(within, StringComparison.OrdinalIgnoreCase) >= 0);
+                if (inside.Count >= 1) same = inside;
+            }
+            if (same.Count == 1) want = same[0];
+            else {
+                why = same.Count == 0 ? "no channel named like that" : same.Count + " channels named like that";
+                CloseSwitcher(pid, hwnd);
+                return false;
+            }
+        }
+        for (int step = 0; step < 15 && !(want != null ? top == want : Names(top, name, within)); step++) {
+            if (Norm(BoxText(pid)) != name || GetForegroundWindow() != hwnd) break;
+            Key(0x28);  // Down: the next result
+            string next = top;
+            var wait = DateTime.Now.AddMilliseconds(400);
+            while (next == top && DateTime.Now < wait) { Thread.Sleep(30); next = Highlighted(pid); }
+            if (next == top) break;  // the end of the list
+            top = next;
+        }
+        if (!(want != null ? top == want : Names(top, name, within))) {
+            why = "no result named like that";
+            CloseSwitcher(pid, hwnd);
+            return false;
+        }
+        if (Norm(BoxText(pid)) != name || GetForegroundWindow() != hwnd) {
+            why = "the quick switcher lost focus";
+            CloseSwitcher(pid, hwnd);
+            return false;
+        }
+        Key(0x0D);  // Enter: open that result
+        until = DateTime.Now.AddMilliseconds(800);
+        while (BoxText(pid) != null && DateTime.Now < until) Thread.Sleep(40);
+        if (BoxText(pid) != null) { why = "it didn't open"; CloseSwitcher(pid, hwnd); return false; }
+        return true;
+    }
+
+    const string BIDI = "[\u200e\u200f\u202a-\u202e\u2066-\u2069]";
+}
+
 public class Bubble : Window {
     // Device-independent pixels. The pill matches Fenn's collapsed notch.
     const double PillW = FennLayout.PillW, PillH = FennLayout.PillH, Wide = 400, CompactW = 340, Pad = 34;
@@ -1126,6 +1543,14 @@ public class Bubble : Window {
                 break;
             case "ringstop":
                 StopRing();
+                break;
+            case "qswitch":
+                // qswitch|id|hwnd|b64 name|b64 within -> answers qswitch|id|<ok|miss|reason>
+                if (f.Length >= 4) QuickSwitcher.Open(f[1], f[2], D(f[3]), f.Length > 4 ? D(f[4]) : "");
+                break;
+            case "ncclick":
+                // ncclick|id|b64 app|b64 title|b64 body -> answers ncclick|id|<ok|miss>
+                if (f.Length >= 5) NotificationCenter.Click(f[1], D(f[2]), D(f[3]), D(f[4]));
                 break;
             case "quit":
                 Application.Current.Shutdown();
