@@ -94,10 +94,28 @@ reach the island either. Turn them back on (banners can stay off).
   click the phone button next to it: its calls no longer pop out or ring
   (they still go into the list). To keep the bubble but ring quieter or not
   at all, use that app's volume slider.
-- **Opening the right chat:** sends the notification's own launch data to the
-  app the way Windows does. That is the app's toast activator found through its
-  Start menu shortcut, a protocol link, or a packaged-app launch. It falls back
-  to just opening the app.
+- **Opening the right chat:** every notification stays clickable, however old
+  and however often clicked. A click, in this order:
+  1. **The app's chat link**, when a helper in `deeplinks.py` can work out the
+     chat from the app's own data (Beeper: `beeper://select-thread/...`).
+  2. **The notification's own click data**, sent the way Windows does it (the
+     app's toast activator, found through its package manifest or Start menu
+     shortcut, a protocol link, or a packaged-app launch). Most apps put the
+     chat into it (WhatsApp, Telegram, Teams, ...), so this works every time.
+  3. **Apps that forget a notification after one click** (built on Electron:
+     their clicks carry only the notification's tag) get a notification of the
+     same chat they still remember, or else just the app.
+
+  Whatever the app does with the click, the plugin also brings the app's own
+  window up at once: out of the tray, the taskbar or from behind other
+  windows, without starting it a second time (the app's window is found
+  through its install folder). An app that isn't running is started and
+  brought up as soon as its window appears.
+
+  **Adding a helper for another app:** write a function in `deeplinks.py` that
+  takes the notification (app id, title, text, arrival time) and returns a
+  link that opens the chat, and list it in `HELPERS` under the app's
+  AppUserModelID. It should only read, and return None when unsure.
 - **The bubble:** a separate, focus-free WPF window (`bubble.ps1`) drawn over
   Fenn's pill, so Fenn's own notch never opens or pins. While the bubble is
   out, a low-level mouse hook routes clicks on the part of the bubble above
@@ -127,6 +145,12 @@ reach the island either. Turn them back on (banners can stay off).
   (`%APPDATA%\BeeperTexts\index.db`, read-only, contacts table only) and copies
   their already-downloaded avatar into its cache. Nothing leaves your PC.
   Switch off **Sender photos** to skip this.
+- **Opening Beeper chats:** Beeper's notifications don't say which chat they
+  belong to, so on a click the plugin finds the message in the same local
+  database (read-only: the messages from around the notification's arrival
+  time, the chat list and the chat members' names) and opens the chat with
+  Beeper's own chat link. Nothing is copied, stored or sent anywhere; only
+  the link is kept in memory. Beeper's stored sign-in data is never read.
 - With **Mute Windows' own notification sounds** on, the plugin sets the
   Notification sound events under `HKCU\AppEvents\Schemes\Apps\.Default` to
   "(None)" (like Control Panel > Sound) and restores the previous sounds when
@@ -137,8 +161,11 @@ reach the island either. Turn them back on (banners can stay off).
 
 ## Known limits
 
-- Some apps (Beeper, for example) don't put the chat into their notification.
-  Clicking then opens the app, but may not jump to the exact chat.
+- Apps that forget a notification after one click and have no helper in
+  `deeplinks.py`: clicking a message again opens the app, but may not jump to
+  the exact chat when no other notification of that chat is left.
+- If Beeper changes its database in an update, clicks fall back to the steps
+  above instead of the chat link.
 - Glass looks show a snapshot from when the bubble opened: video playing
   behind it doesn't move in the blur.
 - The bubble and the unread marker follow Fenn's own settings (position,
@@ -153,6 +180,21 @@ Nook contributors). Color emoji are [Twemoji](https://github.com/jdecked/twemoji
 graphics (CC-BY 4.0, © Twitter, Inc. and other contributors), downloaded at runtime.
 
 ## Changelog
+
+**1.3.3**
+- Fixed: clicking an older notification (in the list or the bubble) was
+  slow or did nothing. Apps like Beeper ignore a click on a notification
+  they have already forgotten, and Windows can keep a window from coming
+  to the front. Now a running app's window is brought up at once (out of
+  the tray, the taskbar or from behind other windows, without starting
+  the app a second time), and an app that isn't running is started and
+  brought up as soon as its window appears. Every notification in the list
+  stays clickable, however old, and also after it was opened.
+- Fixed: clicking a message again could open the wrong chat (the one last
+  open). Apps that forget a notification after one click (Electron apps)
+  now get a notification of the same chat they still remember, and Beeper
+  chats open through Beeper's own chat link, found in its local database.
+  Helpers for more apps can be added in `deeplinks.py`.
 
 **1.3.2**
 - Calls from any app show as calls: a green phone as the picture, the app's

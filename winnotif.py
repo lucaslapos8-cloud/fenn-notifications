@@ -796,31 +796,238 @@ def _packaged_activate(aumid, args):
         release(mgr)
 
 
-def activate(aumid, args="", activation="foreground", inputs=None, log=None, launch_only=False):
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
+kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+_ENUM_CHILD = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+user32.EnumChildWindows.argtypes = [wt.HWND, _ENUM_CHILD, wt.LPARAM]
+
+
+def _process_path(pid):
+    h = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        buf, size = ctypes.create_unicode_buffer(1024), wt.DWORD(1024)
+        return buf.value if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)) else ""
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def foreground_paths():
+    """Program paths behind the window in front (with the windows inside it:
+    Store apps' windows belong to ApplicationFrameHost, the app is a child)."""
+    fg = user32.GetForegroundWindow()
+    if not fg:
+        return set()
+    pids = set()
+
+    def add(hwnd, _=0):
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        pids.add(pid.value)
+        return True
+    add(fg)
+    user32.EnumChildWindows(fg, _ENUM_CHILD(add), 0)
+    return {p.lower() for p in map(_process_path, pids) if p}
+
+
+def app_in_front(folder):
+    folder = os.path.normcase(os.path.abspath(folder)).rstrip("\\") + "\\"
+    return any(os.path.normcase(p).startswith(folder) for p in foreground_paths())
+
+
+_ENUM_WIN = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+user32.EnumWindows.argtypes = [_ENUM_WIN, wt.LPARAM]
+user32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+user32.GetWindow.restype = wt.HWND
+user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+user32.IsWindowVisible.argtypes = [wt.HWND]
+user32.IsIconic.argtypes = [wt.HWND]
+user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+user32.SetForegroundWindow.argtypes = [wt.HWND]
+user32.BringWindowToTop.argtypes = [wt.HWND]
+user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
+
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [("length", wt.UINT), ("flags", wt.UINT), ("showCmd", wt.UINT), ("ptMinPosition", wt.POINT),
+                ("ptMaxPosition", wt.POINT), ("rcNormalPosition", wt.RECT)]
+
+
+user32.GetWindowPlacement.argtypes = [wt.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+
+
+def main_window(folder):
+    """The app's main window (shown, minimised or hidden in the tray), or
+    None when the app isn't running: a titled, captioned, unowned, real-sized
+    top-level window of a program in the app's folder."""
+    folder = os.path.normcase(os.path.abspath(folder)).rstrip("\\") + "\\"
+    best, paths = [], {}
+
+    def cb(hwnd, _):
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value not in paths:
+            paths[pid.value] = os.path.normcase(_process_path(pid.value))
+        if not paths[pid.value].startswith(folder):
+            return True
+        style = user32.GetWindowLongW(hwnd, -16) & 0xFFFFFFFF
+        ex = user32.GetWindowLongW(hwnd, -20) & 0xFFFFFFFF
+        if (style & 0x00C00000) != 0x00C00000 or ex & 0x80 or user32.GetWindow(hwnd, 4):
+            return True  # no caption, a tool window, or owned by another window
+        if not user32.GetWindowTextLengthW(hwnd):
+            return True
+        p = WINDOWPLACEMENT()
+        p.length = ctypes.sizeof(p)
+        user32.GetWindowPlacement(hwnd, ctypes.byref(p))  # its size even while minimised
+        r = p.rcNormalPosition
+        w, h = r.right - r.left, r.bottom - r.top
+        if w < 300 or h < 200:
+            return True
+        best.append((bool(user32.IsWindowVisible(hwnd)), w * h, hwnd))
+        return True
+    user32.EnumWindows(_ENUM_WIN(cb), 0)
+    return max(best)[2] if best else None
+
+
+def raise_window(hwnd):
+    """Shows the window (out of the tray or the taskbar) and puts it in front.
+    Windows only lets the program with the latest input take the front, so
+    borrow the front window's input queue for the moment."""
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    elif not user32.IsWindowVisible(hwnd):
+        user32.ShowWindow(hwnd, 5)  # SW_SHOW
+    fg = user32.GetForegroundWindow()
+    me = kernel32.GetCurrentThreadId()
+    other = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    attached = bool(other and other != me and user32.AttachThreadInput(me, other, True))
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(me, other, False)
+    if user32.GetForegroundWindow() != hwnd:
+        _allow_foreground()
+        user32.SetForegroundWindow(hwnd)
+    end = time.monotonic() + 0.3  # a restore animates for a moment
+    while user32.GetForegroundWindow() != hwnd and time.monotonic() < end:
+        time.sleep(0.02)
+    return user32.GetForegroundWindow() == hwnd
+
+
+def _launch(aumid):
+    if "!" in aumid:
+        try:
+            _packaged_activate(aumid, "")
+            return
+        except Exception:
+            pass
+    os.startfile(apps_folder(aumid))
+
+
+def activate(aumid, args="", activation="foreground", inputs=None, log=None, launch_only=False, check=False):
     """Runs on a worker thread so a slow app never stalls the plugin.
-    launch_only: no notification to act on any more, just bring the app up."""
+    launch_only: no notification to act on any more, just bring the app up.
+    check: a click that should bring the app up. If the app is running, its
+    window comes to the front at once (out of the tray or the taskbar),
+    while the click goes to the app alongside: handing a click to an app
+    can take seconds (Windows starts a helper copy of e.g. Beeper to pass
+    it on), apps like Beeper ignore a click on a notification they have
+    already forgotten, and Windows may keep the app from taking the front
+    itself. If the app isn't running, the click starts it and its window is
+    brought up as soon as it appears."""
+    def say(msg, level="info"):
+        if log:
+            log(msg, level)
+
     def work():
         com_init()
-        _allow_foreground()
-        steps = []
-        if activation == "protocol" and args:
-            steps.append(("protocol", lambda: os.startfile(args)))
-        clsid = None if launch_only else toast_activator(aumid)
-        if clsid and activation != "protocol":
-            steps.append(("activator " + clsid, lambda: _com_activate(clsid, aumid, args, inputs or {})))
-        if "!" in aumid and activation != "protocol":
-            steps.append(("packaged", lambda: _packaged_activate(aumid, args)))
-        steps.append(("apps folder", lambda: os.startfile(apps_folder(aumid))))
-        for name, fn in steps:
-            try:
-                fn()
-                if log:
-                    log(f"opened {aumid} via {name}")
-                return
-            except Exception as e:  # try the next way
-                if log:
-                    log(f"{name} failed for {aumid}: {e}", "warn")
+        folder = app_folder(aumid) if check or launch_only else None
+        hwnd = main_window(folder) if folder else None
+        if hwnd:  # running: up at once, never a second start of the app
+            raise_window(hwnd)
+            say(f"brought {aumid} to the front")
+        if launch_only:
+            if folder and not hwnd:
+                _start_and_raise(aumid, folder, say)
+            elif not folder:
+                _run_steps(aumid, "", "foreground", {}, say, launch_only=True)
+            return
+        name = _run_steps(aumid, args, activation, inputs or {}, say)
+        if check and folder and not hwnd and name:
+            # Not running: the click is starting it (or, for "apps folder", the plain start).
+            came = _wait_and_raise(aumid, folder, say, 15.0 if name == "apps folder" else 5.0)
+            if not came and name != "apps folder":
+                _start_and_raise(aumid, folder, say)
     threading.Thread(target=work, daemon=True).start()
+
+
+def _run_steps(aumid, args, activation, inputs, say, launch_only=False):
+    """Hands the click to the app the first way that works; returns its name."""
+    _allow_foreground()
+    steps = []
+    if activation == "protocol" and args:
+        steps.append(("protocol", lambda: os.startfile(args)))
+    clsid = None if launch_only else toast_activator(aumid)
+    if clsid and activation != "protocol":
+        steps.append(("activator " + clsid, lambda: _com_activate(clsid, aumid, args, inputs)))
+    if "!" in aumid and activation != "protocol":
+        steps.append(("packaged", lambda: _packaged_activate(aumid, args)))
+    steps.append(("apps folder", lambda: os.startfile(apps_folder(aumid))))
+    for name, fn in steps:
+        try:
+            fn()
+            say(f"opened {aumid} via {name}")
+            return name
+        except Exception as e:  # try the next way
+            say(f"{name} failed for {aumid}: {e}", "warn")
+    return None
+
+
+def _wait_and_raise(aumid, folder, log, seconds):
+    """Waits for the app's window and brings it to the front; False if none
+    came. A window that stays hidden (an app that started into the tray) is
+    shown after a short grace, so it isn't caught half-drawn."""
+    end = time.monotonic() + seconds
+    hidden_since = None
+    while time.monotonic() < end:
+        if app_in_front(folder):
+            return True
+        hwnd = main_window(folder)
+        if hwnd and user32.IsWindowVisible(hwnd):
+            raise_window(hwnd)
+            return True
+        if hwnd:
+            hidden_since = hidden_since or time.monotonic()
+            if time.monotonic() - hidden_since > 1.5:
+                raise_window(hwnd)
+                if log:
+                    log(f"brought {aumid} out of the tray")
+                return True
+        time.sleep(0.1)
+    return False
+
+
+def _start_and_raise(aumid, folder, log):
+    try:
+        _allow_foreground()
+        _launch(aumid)
+        if log:
+            log(f"started {aumid}")
+    except Exception as e:
+        if log:
+            log(f"starting {aumid} failed: {e}", "warn")
+        return
+    _wait_and_raise(aumid, folder, log, 15.0)
 
 
 # ---------------------------------------------------------------------------

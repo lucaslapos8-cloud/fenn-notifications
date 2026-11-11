@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 
+import deeplinks
 import fenn
 import winnotif as wn
 
@@ -1005,22 +1006,40 @@ def run_action(n, action, inputs=None):
     draw()
 
 
+def one_shot(n):
+    """Apps built on Electron (Beeper and many more) answer a click only
+    while they still remember the notification: until its first click, and
+    while Windows still has it. Their clicks carry just the notification's
+    tag, with no launch string of their own."""
+    return not n["info"]["launch"] and "tag=" in wn.click_arguments(n)
+
+
 def open_note(n):
-    """Does what clicking the Windows notification would do. Apps like Beeper
-    find the chat through the live notification (args carry its tag) and
-    remove their notifications once the chat is read, so an older message's
-    own args can be stale: then use the newest notification of the same
-    conversation that Windows still has, or just bring the app up."""
+    """Opens the chat a notification came from, however old it is and
+    however often it was clicked:
+    1. A direct link to the chat when the app has one (deeplinks.py).
+    2. Otherwise the notification's own click, which most apps understand
+       every time (it says which chat it is).
+    3. For apps that forget a notification after one click: a notification
+       of the same chat they still remember, or else just the app."""
     n["unread"] = False
-    args = wn.click_arguments(n)
-    target = n
-    if "tag=" in args and not feed.still_present(n["id"]):
-        key = conv_key(n)
-        target = next((x for x in notes if conv_key(x) == key and feed.still_present(x["id"])), None)
-    if target is not None:
-        wn.activate(target["aumid"], wn.click_arguments(target), target["info"]["activation"], log=app.log)
+    link = deeplinks.chat_link(n)
+    if link:
+        app.log(f"{n['app']}: opening the chat through its link")
+        wn.activate(n["aumid"], link, "protocol", log=app.log, check=True)
     else:
-        wn.activate(n["aumid"], "", "foreground", log=app.log, launch_only=True)
+        target = n
+        if one_shot(n) and (n.get("clicked") or not feed.still_present(n["id"])):
+            key = conv_key(n)
+            target = next((x for x in notes if conv_key(x) == key and not x.get("clicked")
+                           and feed.still_present(x["id"])), None)
+        if target is not None:
+            target["clicked"] = True
+            wn.activate(target["aumid"], wn.click_arguments(target), target["info"]["activation"], log=app.log,
+                        check=True)
+        else:
+            wn.activate(n["aumid"], "", "foreground", log=app.log, launch_only=True)
+    n["clicked"] = True
     draw()
 
 
